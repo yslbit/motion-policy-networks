@@ -1,0 +1,32 @@
+training_model_parameters:
+    point_match_loss_weight: 1
+    collision_loss_weight: 5
+data_module_parameters:
+  data_dir: /data
+  trajectory_key: 'hybrid_solutions'
+  num_obstacle_points: 4096 #4096
+  num_target_points: 128 #128
+  random_scale: 0.015
+  num_workers: 24
+  persistent_workers: true
+  prefetch_factor: 4
+shared_parameters:
+    num_robot_points: 2048 #2048
+checkpoint_interval: 10000
+keep_latest_checkpoints: 3
+save_last_checkpoint: true
+validation_interval: 3000
+limit_val_batches: 50
+num_sanity_val_steps: 0
+float32_matmul_precision: high
+gpus: 1
+batch_size: 256
+# Reduced from 69: speeds up intermediate validation; set back to 69 for final evaluation
+val_rollout_steps: 69
+save_checkpoint_dir: /workspace/mpinets_checkpoints_aubo
+wandb_project: mpinets-aubo
+wandb_save_dir: /workspace/mpinets_checkpoints_aubo/wandb
+wandb_log_model: false
+wandb_watch: false
+experiment_name: AuboI3TrainingJob
+description: "MPiNets training for Aubo i3 (6-DOF, no gripper). Data generated with OMPL RRTConnect, global solutions only."

@@ -20,24 +20,24 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-from geometrout.primitive import Cuboid, Cylinder
+from geometrout.primitive import Cuboid, CuboidArray, Cylinder, CylinderArray
 from geometrout.transform import SE3
-from robofin.bullet import Bullet, BulletFranka, BulletFrankaGripper
-from robofin.robots import FrankaGripper, FrankaRobot, FrankaRealRobot
+from robofin.bullet import Bullet, BulletAubo, BulletFranka
+from robofin.robots import FrankaRobot, FrankaRealRobot
+from robofin.robots_aubo import AuboRobot
 from robofin.collision import FrankaSelfCollisionChecker
+from robofin.collision_aubo import AuboCollisionSpheres
 import yourdfpy
 import trimesh.transformations as tra
 import trimesh
 import numpy as np
-
-from pyquaternion import Quaternion
 
 import re
 import time
 import random
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Sequence
+from typing import Any, List, Optional, Tuple, Dict, Sequence, Union
 
 from mpinets.data_pipeline.environments.base_environment import (
     TaskOrientedCandidate,
@@ -50,9 +50,8 @@ from mpinets.data_pipeline.environments.base_environment import (
 @dataclass
 class DresserCandidate(TaskOrientedCandidate):
     """
-    Represents a configuration, its end-effector pose (in right_gripper frame), and
-    some metadata about the dresser (i.e. which drawer it belongs to and the free space
-    inside that drawer)
+    Represents a configuration, its end-effector pose, and some metadata about the dresser
+    (i.e. which drawer it belongs to and the free space inside that drawer).
     """
 
     drawer_idx: int
@@ -76,11 +75,416 @@ class Container:
 
 
 class DresserEnvironment(Environment):
-    def __init__(self):
+    def __init__(self, max_reach: float = Environment.FRANKA_MAX_REACH):
         super().__init__()
+        self.max_reach = max_reach
+        self._reach_scale = max_reach / self.FRANKA_MAX_REACH
         self.demo_candidates = []
 
-    def _gen(self, selfcc: FrankaSelfCollisionChecker) -> bool:
+    def _uses_aubo(self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]) -> bool:
+        return isinstance(selfcc, AuboCollisionSpheres)
+
+    def _uses_compact_workspace_profile(self) -> bool:
+        return self.max_reach < (self.FRANKA_MAX_REACH - 1e-6)
+
+    def _same_level_rejection_probability(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> float:
+        # Aubo's limited reach means fewer valid drawer pairs exist;
+        # rejecting same-level pairs is wasteful.
+        return 0.0 if self._uses_aubo(selfcc) else 0.7
+
+    def _drawer_pose_sample_count(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> int:
+        return 400 if self._uses_aubo(selfcc) else 100
+
+    def _drawer_vertical_offset(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> float:
+        # AUBO uses wrist3_Link directly as the task frame, so it does not need as
+        # much "inside the drawer" clearance as Franka's gripper frame.
+        # Keep this small: the vertical_offset directly shrinks the support volume
+        # height, and the wrist3 sphere (r=0.049) needs min_dim >= 0.098 to fit.
+        return 0.01 if self._uses_aubo(selfcc) else 0.05
+
+    def _drawer_theta_radius(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> float:
+        return (np.pi / 6) if self._uses_aubo(selfcc) else (np.pi / 4)
+
+    def _start_pose_attempts(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> int:
+        return 3 if self._uses_aubo(selfcc) else 1
+
+    def _aubo_drawer_config_sample_count(self) -> int:
+        return 1000
+
+    def _aubo_drawer_task_offset(self) -> float:
+        # Aubo i3H has no gripper: wrist3_Link IS the TCP.
+        # Any non-zero offset shifts wrist3 away from the sampled task point,
+        # which in the compact-profile dresser (depth ~12 cm) pushes wrist3
+        # outside the drawer ~30-40% of the time.
+        return 0.0
+
+    def _aubo_drawer_task_tolerance(self) -> float:
+        # Allow the wrist3 sphere to protrude by up to 1.5 cm.
+        # The obstacle collision check still prevents physical collisions;
+        # this tolerance just relaxes the "fully inside support volume" rule
+        # so that the usable safe zone is large enough to find solutions.
+        return 0.015
+
+    def _aubo_drawer_fallback_tolerance(self) -> float:
+        # Slightly more lenient fallback when no perfect pose is found.
+        return 0.02
+
+    def _aubo_effective_reach(self) -> float:
+        # Leave ~15% margin for wrist orientation freedom on a 6-DOF arm.
+        return self.max_reach * 0.85
+
+    def _aubo_pose_from_task_point(
+        self,
+        task_point: np.ndarray,
+        x_dir: np.ndarray,
+        y_dir: np.ndarray,
+        z_dir: np.ndarray,
+    ) -> SE3:
+        return SE3.from_unit_axes(
+            origin=task_point + self._aubo_drawer_task_offset() * x_dir,
+            x=x_dir,
+            y=y_dir,
+            z=z_dir,
+        )
+
+    def _aubo_task_point_from_pose(self, pose: SE3) -> np.ndarray:
+        return (
+            np.asarray(pose.xyz, dtype=np.float64)
+            - self._aubo_drawer_task_offset() * pose.matrix[:3, 0]
+        )
+
+    def target_point_from_pose(self, pose: SE3) -> np.ndarray:
+        return self._aubo_task_point_from_pose(pose)
+
+    def _aubo_support_volume_can_fit_eef(
+        self,
+        selfcc: AuboCollisionSpheres,
+        support_volume: Cuboid,
+    ) -> bool:
+        # The current Aubo EEF model is a single wrist3 sphere, but using the
+        # maximum radius keeps this safe if more EEF spheres are added later.
+        max_radius = float(np.max(selfcc.cspheres["wrist3_Link"].radii))
+        return float(np.min(support_volume.dims)) >= (2.0 * max_radius)
+
+    def _aubo_eef_support_clearance(
+        self,
+        pose: SE3,
+        selfcc: AuboCollisionSpheres,
+        support_volume: Cuboid,
+    ) -> float:
+        info = selfcc.eef_csphere_info(pose, frame=self._eef_frame(selfcc))
+        return float(np.max(support_volume.sdf(info.centers) + info.radii))
+
+    def _support_volume_reachable(self, support_volume: Cuboid) -> bool:
+        center = np.asarray(support_volume.center)
+        return float(np.linalg.norm(center)) <= self._aubo_effective_reach()
+
+    def _normalize_direction(self, direction: np.ndarray) -> np.ndarray:
+        norm = np.linalg.norm(direction)
+        if norm < 1e-8:
+            raise ValueError("Cannot normalize a near-zero direction vector")
+        return direction / norm
+
+    def _drawer_axes(self, drawer_idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        drawer_node = f"drawer_{drawer_idx}"
+        if drawer_node not in self.scene.graph.nodes:
+            drawer_node = f"dresser/{drawer_node}"
+        drawer_transform = self.scene.graph.get(drawer_node)[0]
+        front_dir = np.asarray(drawer_transform[:3, 1], dtype=np.float64)
+        up_dir = np.asarray(drawer_transform[:3, 2], dtype=np.float64)
+        front_dir = self._normalize_direction(front_dir)
+        up_dir = self._normalize_direction(up_dir)
+        if np.dot(up_dir, np.array([0.0, 0.0, 1.0])) < 0.0:
+            up_dir = -up_dir
+        outward_hint = np.asarray(drawer_transform[:3, 3], dtype=np.float64) - np.asarray(
+            self.dresser_asset.centroid,
+            dtype=np.float64,
+        )
+        outward_hint[2] = 0.0
+        if np.linalg.norm(outward_hint) > 1e-8 and np.dot(front_dir, outward_hint) < 0.0:
+            front_dir = -front_dir
+        right_dir = self._normalize_direction(np.cross(front_dir, up_dir))
+        return right_dir, front_dir, up_dir
+
+    def _aubo_front_entry_pose_and_config(
+        self,
+        sim: Bullet,
+        arm: BulletAubo,
+        selfcc: AuboCollisionSpheres,
+        support_volume: Cuboid,
+        primitive_arrays: List[Any],
+        drawer_idx: int,
+    ) -> Tuple[Optional[SE3], Optional[np.ndarray]]:
+        right_dir, front_dir, up_dir = self._drawer_axes(drawer_idx)
+        samples = support_volume.sample_volume(self._drawer_pose_sample_count(selfcc))
+        relative = samples - np.asarray(support_volume.center)
+        front_scores = relative @ front_dir
+        side_scores = np.abs(relative @ right_dir)
+        height_scores = np.abs(relative @ up_dir)
+        front_cutoff = -0.10 * float(support_volume.dims[1])
+        preferred = samples[front_scores >= front_cutoff]
+        if len(preferred) == 0:
+            preferred = samples
+            preferred_relative = relative
+            preferred_front_scores = front_scores
+        else:
+            preferred_relative = preferred - np.asarray(support_volume.center)
+            preferred_front_scores = preferred_relative @ front_dir
+        preferred_side_scores = np.abs(preferred_relative @ right_dir)
+        preferred_height_scores = np.abs(preferred_relative @ up_dir)
+        order = np.lexsort(
+            (
+                preferred_height_scores,
+                preferred_side_scores,
+                -preferred_front_scores,
+            )
+        )
+        preferred = preferred[order]
+        down_dir = -up_dir
+        base_side_dir = self._normalize_direction(np.cross(down_dir, front_dir))
+        best_pose = None
+        best_config = None
+        best_clearance = np.inf
+        for task_point in preferred:
+            for roll in (-0.35, -0.15, 0.0, 0.15, 0.35):
+                side_dir = (
+                    np.cos(roll) * base_side_dir + np.sin(roll) * down_dir
+                )
+                side_dir = self._normalize_direction(side_dir)
+                z_dir = self._normalize_direction(np.cross(front_dir, side_dir))
+                pose = self._aubo_pose_from_task_point(
+                    task_point,
+                    front_dir,
+                    side_dir,
+                    z_dir,
+                )
+                eef_clearance = self._aubo_eef_support_clearance(
+                    pose, selfcc, support_volume
+                )
+                if eef_clearance < best_clearance:
+                    best_clearance = eef_clearance
+                    best_pose = pose
+                if eef_clearance > self._aubo_drawer_task_tolerance():
+                    continue
+                if self._eef_in_collision(pose, selfcc, primitive_arrays, arm):
+                    continue
+                config = self._collision_free_ik(pose, selfcc, primitive_arrays, arm)
+                if config is None:
+                    continue
+                arm.marionette(config)
+                if sim.in_collision(arm, check_self=True):
+                    continue
+                return pose, config
+        if (
+            best_pose is not None
+            and best_clearance <= self._aubo_drawer_fallback_tolerance()
+        ):
+            config = self._collision_free_ik(best_pose, selfcc, primitive_arrays, arm)
+            if config is not None:
+                arm.marionette(config)
+                if not sim.in_collision(arm, check_self=True):
+                    return best_pose, config
+        return None, None
+
+    def _aubo_config_sample_pose_and_config(
+        self,
+        sim: Bullet,
+        arm: BulletAubo,
+        selfcc: AuboCollisionSpheres,
+        support_volume: Cuboid,
+        primitive_arrays: List[Any],
+    ) -> Tuple[Optional[SE3], Optional[np.ndarray]]:
+        joint_limits = AuboRobot.constants.JOINT_LIMITS
+        neutral = AuboRobot.constants.NEUTRAL
+        best_pose = None
+        best_config = None
+        best_clearance = np.inf
+        for ii in range(self._aubo_drawer_config_sample_count()):
+            if ii < int(0.7 * self._aubo_drawer_config_sample_count()):
+                config = np.clip(
+                    neutral + np.random.normal(0.0, 0.45, 6),
+                    joint_limits[:, 0],
+                    joint_limits[:, 1],
+                )
+            else:
+                config = np.random.uniform(
+                    joint_limits[:, 0],
+                    joint_limits[:, 1],
+                )
+            if selfcc.has_self_collision(config):
+                continue
+            arm.marionette(config)
+            if sim.in_collision(arm, check_self=True):
+                continue
+            pose = AuboRobot.fk(config, eff_frame=self._eef_frame(selfcc))
+            eef_clearance = self._aubo_eef_support_clearance(
+                pose, selfcc, support_volume
+            )
+            if eef_clearance < best_clearance:
+                best_clearance = eef_clearance
+                best_pose = pose
+                best_config = np.copy(config)
+            if eef_clearance > self._aubo_drawer_task_tolerance():
+                continue
+            if self._eef_in_collision(pose, selfcc, primitive_arrays, arm):
+                continue
+            return pose, config
+        if (
+            best_pose is not None
+            and best_clearance <= self._aubo_drawer_fallback_tolerance()
+            and not self._eef_in_collision(best_pose, selfcc, primitive_arrays, arm)
+        ):
+            return best_pose, best_config
+        return None, None
+
+    def _aubo_topdown_pose_and_config(
+        self,
+        sim: Bullet,
+        arm: BulletAubo,
+        selfcc: AuboCollisionSpheres,
+        support_volume: Cuboid,
+        primitive_arrays: List[Any],
+    ) -> Tuple[Optional[SE3], Optional[np.ndarray]]:
+        """Top-down approach: wrist3_Link points straight down into the drawer.
+
+        This mirrors how Franka handles drawers and is often more reachable
+        than the front-entry approach for a short 6-DOF arm.
+        """
+        samples = support_volume.sample_volume(self._drawer_pose_sample_count(selfcc))
+        # Sort by distance from base (closer = more likely reachable)
+        dists = np.linalg.norm(samples, axis=1)
+        order = np.argsort(dists)
+        samples = samples[order]
+
+        for sample in samples:
+            for theta in (0.0, 0.3, -0.3, 0.6, -0.6):
+                x = np.array([np.cos(theta), np.sin(theta), 0.0], dtype=np.float64)
+                z = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+                y = np.cross(z, x)
+                pose = self._aubo_pose_from_task_point(sample, x, y, z)
+                if (
+                    self._aubo_eef_support_clearance(pose, selfcc, support_volume)
+                    > self._aubo_drawer_task_tolerance()
+                ):
+                    continue
+                if self._eef_in_collision(pose, selfcc, primitive_arrays, arm):
+                    continue
+                config = self._collision_free_ik(pose, selfcc, primitive_arrays, arm)
+                if config is None:
+                    continue
+                arm.marionette(config)
+                if sim.in_collision(arm, check_self=True):
+                    continue
+                return pose, config
+        return None, None
+
+    def _eef_frame(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> str:
+        return "wrist3_Link" if self._uses_aubo(selfcc) else "right_gripper"
+
+    def _default_prismatic_joint(self, arm: Union[BulletFranka, BulletAubo]) -> float:
+        return getattr(arm, "default_prismatic_value", 0.025)
+
+    def _build_primitive_arrays(self) -> List[Any]:
+        primitive_arrays: List[Any] = []
+        cuboids = self.cuboids
+        cylinders = self.cylinders
+        if cuboids:
+            primitive_arrays.append(CuboidArray(cuboids))
+        if cylinders:
+            primitive_arrays.append(CylinderArray(cylinders))
+        return primitive_arrays
+
+    def _load_planning_arm(
+        self, sim: Bullet, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> Union[BulletFranka, BulletAubo]:
+        if self._uses_aubo(selfcc):
+            return sim.load_robot(BulletAubo)
+        return sim.load_robot(FrankaRobot)
+
+    def _has_self_collision(
+        self,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+        config: np.ndarray,
+        arm: Union[BulletFranka, BulletAubo],
+    ) -> bool:
+        if self._uses_aubo(selfcc):
+            return selfcc.has_self_collision(config)
+        return selfcc.has_self_collision(config, self._default_prismatic_joint(arm))
+
+    def _eef_in_collision(
+        self,
+        pose: SE3,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+        primitive_arrays: List[Any],
+        arm: Union[BulletFranka, BulletAubo],
+    ) -> bool:
+        if self._uses_aubo(selfcc):
+            return selfcc.aubo_eef_collides_fast(
+                pose,
+                primitive_arrays,
+                frame=self._eef_frame(selfcc),
+            )
+        return selfcc.franka_eef_collides_fast(
+            pose,
+            self._default_prismatic_joint(arm),
+            primitive_arrays,
+            frame=self._eef_frame(selfcc),
+        )
+
+    def _collision_free_ik(
+        self,
+        pose: SE3,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+        primitive_arrays: List[Any],
+        arm: Union[BulletFranka, BulletAubo],
+    ) -> Optional[np.ndarray]:
+        if self._uses_aubo(selfcc):
+            return AuboRobot.collision_free_ik(
+                pose,
+                selfcc,
+                primitive_arrays,
+                eff_frame=self._eef_frame(selfcc),
+                retries=1000,
+            )
+        return FrankaRealRobot.collision_free_ik(
+            pose,
+            self._default_prismatic_joint(arm),
+            selfcc,
+            primitive_arrays,
+            eff_frame=self._eef_frame(selfcc),
+            retries=1000,
+        )
+
+    def _random_neutral_config(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> np.ndarray:
+        if self._uses_aubo(selfcc):
+            return AuboRobot.random_neutral()
+        return FrankaRealRobot.random_neutral(method="uniform")
+
+    def _forward_kinematics(
+        self,
+        config: np.ndarray,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+    ) -> SE3:
+        if self._uses_aubo(selfcc):
+            return AuboRobot.fk(config, eff_frame=self._eef_frame(selfcc))
+        return FrankaRealRobot.fk(config, eff_frame=self._eef_frame(selfcc))
+
+
+    def _gen(self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]) -> bool:
         self.dresser_asset = self._gen_dresser()
 
         self.joint_names = self.dresser_asset._model.actuated_joint_names
@@ -102,14 +506,15 @@ class DresserEnvironment(Environment):
 
             cnt += 1
 
-        assert len(self.scene_containers) > 0
+        if len(self.scene_containers) == 0:
+            self.demo_candidates = []
+            return False
 
         indices = list(range(len(self.joint_names)))
         random.shuffle(indices)
 
         sim = Bullet(gui=False)
-        gripper = sim.load_robot(FrankaGripper)
-        arm = sim.load_robot(FrankaRobot)
+        arm = self._load_planning_arm(sim, selfcc)
 
         (
             start_pose,
@@ -125,51 +530,95 @@ class DresserEnvironment(Environment):
             res = self._label_containment()
             self.scene_containers["volume"] = res
             sim.load_primitives(self.obstacles)
-            start_support_volume = self.get_support_volume(idx_start)
-            if start_support_volume is None:
-                continue
-            start_pose, start_q = self.random_pose_and_config(
-                sim, gripper, arm, selfcc, start_support_volume
+            primitive_arrays = self._build_primitive_arrays()
+            start_support_volume = self.get_support_volume(
+                idx_start,
+                vertical_offset=self._drawer_vertical_offset(selfcc),
             )
-            sim.clear_all_obstacles()
-            if start_pose is None or start_q is None:
+            if start_support_volume is None:
+                sim.clear_all_obstacles()
                 self.close_drawer(idx_start)
                 continue
-            for j in range(i + 1, len(indices)):
-                idx_target = indices[j]
-                self.open_drawer(idx_target)
-                res = self._label_containment()
-                self.scene_containers["volume"] = res
-                sim.load_primitives(self.obstacles)
-                # Check whether the previous solution is still valid
-                arm.marionette(start_q)
-                if sim.in_collision(arm):
+            if self._uses_aubo(selfcc):
+                if not self._support_volume_reachable(start_support_volume):
                     sim.clear_all_obstacles()
-                    self.close_drawer(idx_target)
+                    self.close_drawer(idx_start)
                     continue
-                target_support_volume = self.get_support_volume(idx_target)
-                if target_support_volume is None:
+                if not self._aubo_support_volume_can_fit_eef(selfcc, start_support_volume):
+                    sim.clear_all_obstacles()
+                    self.close_drawer(idx_start)
                     continue
-
-                # Flip a weighted coin and in 70% of cases, do not allow start
-                # and target volumes to be on the same level
-                if np.random.rand() > 0.3 and np.isclose(
-                    np.max(start_support_volume.corners, axis=0)[2],
-                    np.max(target_support_volume.corners, axis=0)[2],
-                    atol=0.05,
-                ):
-                    continue
-
-                (
-                    target_pose,
-                    target_q,
-                ) = self.random_pose_and_config(
-                    sim, gripper, arm, selfcc, target_support_volume
+            for _ in range(self._start_pose_attempts(selfcc)):
+                start_pose, start_q = self.random_pose_and_config(
+                    sim,
+                    arm,
+                    selfcc,
+                    start_support_volume,
+                    primitive_arrays,
+                    drawer_idx=idx_start,
                 )
                 sim.clear_all_obstacles()
+                if start_pose is None or start_q is None:
+                    continue
+                for j in range(i + 1, len(indices)):
+                    idx_target = indices[j]
+                    self.open_drawer(idx_target)
+                    res = self._label_containment()
+                    self.scene_containers["volume"] = res
+                    sim.load_primitives(self.obstacles)
+                    primitive_arrays = self._build_primitive_arrays()
+                    # Check whether the previous solution is still valid
+                    arm.marionette(start_q)
+                    if sim.in_collision(arm):
+                        sim.clear_all_obstacles()
+                        self.close_drawer(idx_target)
+                        continue
+                    target_support_volume = self.get_support_volume(
+                        idx_target,
+                        vertical_offset=self._drawer_vertical_offset(selfcc),
+                    )
+                    if target_support_volume is None:
+                        sim.clear_all_obstacles()
+                        self.close_drawer(idx_target)
+                        continue
+                    if self._uses_aubo(selfcc):
+                        if not self._support_volume_reachable(target_support_volume):
+                            sim.clear_all_obstacles()
+                            self.close_drawer(idx_target)
+                            continue
+                        if not self._aubo_support_volume_can_fit_eef(
+                            selfcc, target_support_volume
+                        ):
+                            sim.clear_all_obstacles()
+                            self.close_drawer(idx_target)
+                            continue
+
+                    if np.isclose(
+                        np.max(start_support_volume.corners, axis=0)[2],
+                        np.max(target_support_volume.corners, axis=0)[2],
+                        atol=0.05,
+                    ) and np.random.rand() < self._same_level_rejection_probability(selfcc):
+                        sim.clear_all_obstacles()
+                        self.close_drawer(idx_target)
+                        continue
+
+                    (
+                        target_pose,
+                        target_q,
+                    ) = self.random_pose_and_config(
+                        sim,
+                        arm,
+                        selfcc,
+                        target_support_volume,
+                        primitive_arrays,
+                        drawer_idx=idx_target,
+                    )
+                    sim.clear_all_obstacles()
+                    if target_pose is not None and target_q is not None:
+                        break
+                    self.close_drawer(idx_target)
                 if target_pose is not None and target_q is not None:
                     break
-                self.close_drawer(idx_target)
             if target_pose is not None and target_q is not None:
                 break
             self.close_drawer(idx_start)
@@ -196,31 +645,72 @@ class DresserEnvironment(Environment):
         return True
 
     def _gen_dresser(self):
-        # Generate dimensions
-        width, depth, height = (
-            radius_sample(1.0, 0.2),
-            radius_sample(0.3, 0.1),
-            radius_sample(0.7, 0.15),
-        )
-
-        # TODO maybe this will need to be modified because dresser depth
-        # affects the minimum position close to the robot
-
-        # Randomly sample shifts
-        x, y, rotation = (
-            radius_sample(0.65, 0.1),
-            radius_sample(0.0, 0.1),
-            radius_sample(np.pi / 2, np.pi / 3),
-        )
-        transform = tra.euler_matrix(0, 0, rotation)
-        transform[:3, 3] = np.array([x, y, 0])
-
-        return Dresser(
-            width=width,
-            depth=depth,
-            height=height,
-            transform=transform,
-        )
+        s = self._reach_scale
+        for attempt in range(20 if self._uses_compact_workspace_profile() else 1):
+            if self._uses_compact_workspace_profile():
+                # Geometry for compact-reach robots (Aubo i3H, reach≈0.72m).
+                #
+                # KEY INSIGHT: with rotation≈π/2 the dresser body-Y axis maps to
+                # world -X.  Drawers therefore open TOWARD the robot (in -X).
+                # With a deep dresser the open drawer extends all the way back to
+                # x≈0, forcing the arm to reach "under itself" — scene collision
+                # is unavoidable.
+                #
+                # Fix: shorten the depth so the open drawer sits in the accessible
+                # space IN FRONT of the dresser, not back near the robot base:
+                #   dresser centre x = 0.55
+                #   depth           = 0.18  →  front face at x ≈ 0.55 - 0.09 = 0.46
+                #   drawer travel   = 0.18 * 0.9 = 0.162
+                #   open-drawer interior: x = 0.46 – 0.162 = 0.30  to  0.46
+                #   support volume centre x ≈ 0.38  (well within 0.72 m reach)
+                #
+                # The arm approaches the open-drawer space from the robot side
+                # WITHOUT having to thread through the dresser body.
+                width, depth, height = (
+                    radius_sample(0.45, 0.05),
+                    radius_sample(0.18, 0.02),
+                    radius_sample(0.42, 0.04),
+                )
+                x, y, rotation = (
+                    radius_sample(0.55, 0.04),
+                    radius_sample(0.0, 0.05),
+                    radius_sample(np.pi / 2, np.pi / 12),
+                )
+            else:
+                width, depth, height = (
+                    radius_sample(1.0, 0.2),
+                    radius_sample(0.3, 0.1),
+                    radius_sample(0.7, 0.15),
+                )
+                x, y, rotation = (
+                    radius_sample(0.65, 0.1),
+                    radius_sample(0.0, 0.1),
+                    radius_sample(np.pi / 2, np.pi / 3),
+                )
+            transform = tra.euler_matrix(0, 0, rotation)
+            base_z = 0.0
+            transform[:3, 3] = np.array([x, y, base_z])
+            dresser_kwargs = dict(
+                width=width,
+                depth=depth,
+                height=height,
+                transform=transform,
+            )
+            if self._uses_compact_workspace_profile():
+                # Favor 2-3 larger drawers so each support volume can fit the
+                # full wrist3 collision sphere instead of only the frame origin.
+                dresser_kwargs.update(
+                    split_prob=0.38, split_decay=0.58, min_split_size=0.20
+                )
+            dresser = Dresser(**dresser_kwargs)
+            min_drawers = 2
+            max_drawers = 3 if self._uses_compact_workspace_profile() else None
+            num_drawers = len(dresser._model.actuated_joint_names)
+            if num_drawers >= min_drawers and (
+                max_drawers is None or num_drawers <= max_drawers
+            ):
+                return dresser
+        return dresser
 
     def _compute_support_polyhedra(
         self,
@@ -448,7 +938,11 @@ class DresserEnvironment(Environment):
 
         T = self.scene.graph.get(volume.node_name)[0] @ volume.transform
         center_pose = np.eye(4)
-        center_pose[:3, 3] = np.asarray(volume.geometry.extents) / 2
+        # Use the actual AABB center, not extents/2.  The inscribing
+        # polyhedra is created by extrude_polygon in the facet's local frame
+        # where the polygon is NOT necessarily anchored at the origin.
+        # extents/2 only equals the center when bounds[0] == [0,0,0].
+        center_pose[:3, 3] = np.asarray(volume.geometry.bounds).mean(axis=0)
         center_pose = T @ center_pose
         dims = volume.geometry.extents
         # Ensures the the gripper is always at least 5 centimeters inside
@@ -460,28 +954,50 @@ class DresserEnvironment(Environment):
             center_pose[1, 3],
             center_pose[2, 3] - vertical_offset / 2,
         ]
+        pose = SE3.from_matrix(center_pose)
 
         return Cuboid(
             center=center,
             dims=dims,
-            quaternion=Quaternion(matrix=center_pose),
+            quaternion=pose.so3.wxyz,
         )
 
     def random_pose_and_config(
         self,
         sim: Bullet,
-        gripper: BulletFrankaGripper,
-        arm: BulletFranka,
-        selfcc: FrankaSelfCollisionChecker,
+        arm: Union[BulletFranka, BulletAubo],
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
         support_volume: Cuboid,
+        primitive_arrays: Optional[List[Any]] = None,
+        drawer_idx: Optional[int] = None,
     ) -> Tuple[Optional[SE3], Optional[np.ndarray]]:
-        samples = support_volume.sample_volume(100)
+        if primitive_arrays is None:
+            primitive_arrays = self._build_primitive_arrays()
+        if self._uses_aubo(selfcc):
+            if drawer_idx is not None:
+                # Strategy 1: front-entry approach (wrist points into drawer)
+                pose, config = self._aubo_front_entry_pose_and_config(
+                    sim, arm, selfcc, support_volume, primitive_arrays, drawer_idx,
+                )
+                if pose is not None and config is not None:
+                    return pose, config
+                # Strategy 2: top-down approach (wrist points straight down)
+                pose, config = self._aubo_topdown_pose_and_config(
+                    sim, arm, selfcc, support_volume, primitive_arrays,
+                )
+                if pose is not None and config is not None:
+                    return pose, config
+            # Strategy 3: random config sampling (last resort)
+            return self._aubo_config_sample_pose_and_config(
+                sim, arm, selfcc, support_volume, primitive_arrays,
+            )
+        samples = support_volume.sample_volume(self._drawer_pose_sample_count(selfcc))
 
         pose, q = None, None
         for sample in samples:
-            theta = np.random.rand() * np.pi / 2 - np.pi / 4
-            x = np.array([np.cos(theta), np.sin(theta), 0])
-            z = np.array([0, 0, -1])
+            theta = radius_sample(0.0, self._drawer_theta_radius(selfcc))
+            x = np.array([np.cos(theta), np.sin(theta), 0.0], dtype=np.float64)
+            z = np.array([0.0, 0.0, -1.0], dtype=np.float64)
             y = np.cross(z, x)
             pose = SE3.from_unit_axes(
                 origin=sample,
@@ -489,35 +1005,39 @@ class DresserEnvironment(Environment):
                 y=y,
                 z=z,
             )
-            gripper.marionette(pose)
-            if sim.in_collision(gripper):
+            if self._eef_in_collision(pose, selfcc, primitive_arrays, arm):
                 pose = None
                 continue
-            q = FrankaRealRobot.collision_free_ik(sim, arm, selfcc, pose, retries=1000)
-            if q is not None:
-                break
+            q = self._collision_free_ik(pose, selfcc, primitive_arrays, arm)
+            if q is None:
+                pose = None
+                continue
+            arm.marionette(q)
+            if sim.in_collision(arm, check_self=True):
+                pose, q = None, None
+                continue
+            break
         return pose, q
 
     def _gen_neutral_candidates(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[NeutralCandidate]:
         sim = Bullet(gui=False)
-        gripper = sim.load_robot(FrankaGripper)
-        arm = sim.load_robot(FrankaRobot)
+        arm = self._load_planning_arm(sim, selfcc)
         sim.load_primitives(self.obstacles)
+        primitive_arrays = self._build_primitive_arrays()
         candidates: List[NeutralCandidate] = []
         for _ in range(how_many * 50):
             if len(candidates) >= how_many:
                 break
-            sample = FrankaRealRobot.random_neutral(method="uniform")
+            sample = self._random_neutral_config(selfcc)
             arm.marionette(sample)
             if not (
                 sim.in_collision(arm, check_self=True)
-                or selfcc.has_self_collision(sample)
+                or self._has_self_collision(selfcc, sample, arm)
             ):
-                pose = FrankaRealRobot.fk(sample, eff_frame="right_gripper")
-                gripper.marionette(pose)
-                if not sim.in_collision(gripper):
+                pose = self._forward_kinematics(sample, selfcc)
+                if not self._eef_in_collision(pose, selfcc, primitive_arrays, arm):
                     candidates.append(
                         NeutralCandidate(
                             config=sample,
@@ -530,7 +1050,7 @@ class DresserEnvironment(Environment):
         return candidates
 
     def _gen_additional_candidate_sets(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[List[TaskOrientedCandidate]]:
         """
         Creates additional candidates, where the candidates correspond to the support volumes
@@ -538,8 +1058,8 @@ class DresserEnvironment(Environment):
 
         :param how_many int: How many candidates to generate in each support volume (the result is guaranteed
                              to match this number or the function will run forever)
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self
+                                                  collisions using robot-specific sphere models.
         :rtype List[List[TaskOrientedCandidate]]: A pair of candidate sets, where each has `how_many`
                                       candidates that matches the corresponding support volume
                                       for the respective element in `self.demo_candidates`
@@ -549,9 +1069,9 @@ class DresserEnvironment(Environment):
         candidate_sets: List[List[TaskOrientedCandidate]] = []
 
         sim = Bullet(gui=False)
-        gripper = sim.load_robot(FrankaGripper)
-        arm = sim.load_robot(FrankaRobot)
+        arm = self._load_planning_arm(sim, selfcc)
         sim.load_primitives(self.obstacles)
+        primitive_arrays = self._build_primitive_arrays()
 
         for idx, _ in enumerate(self.demo_candidates):
             candidate_set: List[TaskOrientedCandidate] = []
@@ -559,10 +1079,11 @@ class DresserEnvironment(Environment):
             while ii < how_many:
                 pose, q = self.random_pose_and_config(
                     sim,
-                    gripper,
                     arm,
                     selfcc,
                     self.demo_candidates[idx].support_volume,
+                    primitive_arrays,
+                    drawer_idx=self.demo_candidates[idx].drawer_idx,
                 )
                 if pose is not None and q is not None:
                     candidate_set.append(
@@ -602,13 +1123,24 @@ class DresserEnvironment(Environment):
             if isinstance(geom, trimesh.primitives.Box):
                 box_offset = tra.translation_matrix(geom.centroid)
                 transform = transform @ box_offset
-                pose = SE3(transform)
+                pose = SE3.from_matrix(transform)
                 c = Cuboid(
                     center=pose.xyz,
                     quaternion=pose.so3.wxyz,
                     dims=geom.extents,
                 )
                 cuboids.append(c)
+        # Add a ground plane for compact-workspace robots (e.g. Aubo i3H)
+        # so that arm-ground collisions are detected during data generation.
+        if self._uses_compact_workspace_profile():
+            ground_thickness = 0.02
+            cuboids.append(
+                Cuboid(
+                    center=[0.0, 0.0, -ground_thickness / 2],
+                    dims=[4.0, 4.0, ground_thickness],
+                    quaternion=[1.0, 0.0, 0.0, 0.0],
+                )
+            )
         return cuboids
 
     @property
@@ -631,6 +1163,7 @@ class Dresser:
         transform: np.ndarray,
         split_prob: float = 0.7,
         split_decay: float = 0.8,
+        min_split_size: float = 0.3,
     ):
         """Procedural dresser generator based on recursive splitting of compartments.
 
@@ -638,12 +1171,14 @@ class Dresser:
             width (float): Width of dresser.
             depth (float): Depth of dresser.
             height (float): Height of dresser.
-            split_prob (float, optional): The probability of splitting a compartment into two. Defaults to 1.0.
-            split_decay (float, optional): The decay rate of the splitting probability for each level of recursion. Defaults to 0.65.
+            split_prob (float, optional): The probability of splitting a compartment into two. Defaults to 0.7.
+            split_decay (float, optional): The decay rate of the splitting probability for each level of recursion. Defaults to 0.8.
+            min_split_size (float, optional): Minimum dimension for a compartment to be eligible for splitting. Defaults to 0.3.
         """
         self.width = width
         self.depth = depth
         self.height = height
+        self.min_split_size = min_split_size
 
         self.num_drawers = 0
 
@@ -791,7 +1326,11 @@ class Dresser:
         if mesh is None:
             return None
 
-        scaled_mesh = mesh.copy(include_cache=True)
+        try:
+            scaled_mesh = mesh.copy(include_cache=True)
+        except TypeError:
+            # trimesh primitives in newer releases no longer accept include_cache.
+            scaled_mesh = mesh.copy()
 
         my_scale = self._scale
         if orientation is not None:
@@ -973,7 +1512,7 @@ class Dresser:
         prob: float = 0.8,
         decay: float = 0.9,
     ):
-        """Recursive dresser splitting. Width and height have minimum size of 0.3
+        """Recursive dresser splitting.
 
         Args:
             x (float): x-coordinate of 2D coordinates of dresser front.
@@ -983,12 +1522,14 @@ class Dresser:
             prob (float, optional): Probabiliy of splitting further. Defaults to 0.8.
             decay (float, optional): Decay rate of splitting probability. Defaults to 0.9.
         """
+        min_sz = self.min_split_size
+
         # check split probability
         rand = np.random.random()
         do_split = rand < prob
 
         # minimum size for splitting
-        if width < 0.3 and height < 0.3:
+        if width < min_sz and height < min_sz:
             do_split = False
 
         if not do_split:
@@ -1016,9 +1557,9 @@ class Dresser:
         vertical_split = np.random.random() < 0.5
 
         # minimum size for splitting vert/horiz
-        if width < 0.3:
+        if width < min_sz:
             vertical_split = False
-        if height < 0.3:
+        if height < min_sz:
             vertical_split = True
 
         # wrap call to make sure that we pass all params to the lower level
@@ -1155,7 +1696,7 @@ class Dresser:
         wall_thickness = 0.01
         boxes = [
             {
-                "origin": tra.translation_matrix([0, 0, -wall_thickness / 2]),
+                "origin": tra.translation_matrix([0, 0, -wall_thickness / 2]), # 生成一个单位旋转矩阵的转换矩阵，pos为所填参数
                 "size": (width, depth, wall_thickness),
             },
             {

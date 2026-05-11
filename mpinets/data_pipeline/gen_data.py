@@ -81,11 +81,16 @@ NUM_PLANS_PER_SCENE = (
 )
 MAX_JERK = 0.15  # Used for validating the hybrid expert trajectories
 PIPELINE_TIMEOUT = 36000  # 10 hours in seconds--after which all new scenes will immediately return nothing
+DEFAULT_FRANKA_PRISMATIC_JOINT = 0.025
 
 # This parameter dictates the maximum number of cuboids to be used in an environment
 # Some environments have random generation methods and may generate outliers that are extremely complicated
 CUBOID_CUTOFF = 40
 CYLINDER_CUTOFF = 40
+
+
+def default_franka_prismatic_joint(robot: Optional[Any] = None) -> float:
+    return getattr(robot, "default_prismatic_value", DEFAULT_FRANKA_PRISMATIC_JOINT)
 
 
 @dataclass
@@ -122,10 +127,46 @@ def solve_global_plan(
                                           will not be exactly the same because smoothing
                                           is run separately on each
     """
-    planner = FrankaAITStarPlanner()
     sim = Bullet(gui=False)
     sim.load_primitives(obstacles)
     robot = sim.load_robot(FrankaRobot)
+
+    prismatic_joint = default_franka_prismatic_joint(robot)
+
+    def validate_trajectory(path_like) -> np.ndarray:
+        if path_like is None:
+            return np.array([])
+        trajectory = np.asarray(path_like)
+        if trajectory.ndim != 2 or len(trajectory) == 0:
+            return np.array([])
+        for q in trajectory:
+            robot.marionette(q)
+            if sim.in_collision(robot, check_self=True) or selfcc.has_self_collision(
+                q, prismatic_joint
+            ):
+                return np.array([])
+        return trajectory
+
+    def resample_and_validate(path) -> np.ndarray:
+        try:
+            trajectory = Trajectory.from_path(np.asarray(path), length=SEQUENCE_LENGTH)
+        except Exception:
+            return np.array([])
+        if trajectory is None:
+            return np.array([])
+        return validate_trajectory(trajectory.milestones)
+
+    def smooth_and_validate(planner, path):
+        try:
+            smoothed = planner.smooth(path, SEQUENCE_LENGTH)
+        except Exception:
+            smoothed = None
+        validated = validate_trajectory(smoothed)
+        if len(validated):
+            return validated
+        return resample_and_validate(path)
+
+    planner = FrankaAITStarPlanner()
     planner.load_simulation(sim, robot)
     planner.load_self_collision_checker(selfcc)
     path = planner.plan(
@@ -138,19 +179,31 @@ def solve_global_plan(
         spline=True,
         verbose=False,
     )
-    if path is None:
+    if path is not None:
+        forward_smoothed = smooth_and_validate(planner, path)
+        backward_smoothed = smooth_and_validate(planner, path[::-1])
+        if len(forward_smoothed) and len(backward_smoothed):
+            return forward_smoothed, backward_smoothed
+
+    fallback_planner = FrankaRRTConnectPlanner()
+    fallback_planner.load_simulation(sim, robot)
+    fallback_planner.load_self_collision_checker(selfcc)
+    fallback_path = fallback_planner.plan(
+        start=start_candidate.config,
+        goal=target_candidate.config,
+        max_runtime=20,
+        exact=True,
+        shortcut=True,
+        spline=True,
+        verbose=False,
+    )
+    if fallback_path is None:
         return np.array([]), np.array([])
-    forward_smoothed = np.asarray(planner.smooth(path, SEQUENCE_LENGTH))
-    for q in forward_smoothed:
-        robot.marionette(q)
-        if sim.in_collision(robot, check_self=True) or selfcc.has_self_collision(q):
-            return np.array([]), np.array([])
-    backward_smoothed = np.asarray(planner.smooth(path[::-1], SEQUENCE_LENGTH))
-    for q in backward_smoothed:
-        robot.marionette(q)
-        if sim.in_collision(robot, check_self=True) or selfcc.has_self_collision(q):
-            return np.array([]), np.array([])
-    return forward_smoothed, backward_smoothed
+    forward_smoothed = smooth_and_validate(fallback_planner, fallback_path)
+    backward_smoothed = smooth_and_validate(fallback_planner, fallback_path[::-1])
+    if len(forward_smoothed) and len(backward_smoothed):
+        return forward_smoothed, backward_smoothed
+    return np.array([]), np.array([])
 
 
 def plan_end_effector(
@@ -176,6 +229,7 @@ def plan_end_effector(
     gripper = sim.load_robot(FrankaGripper)
     sim.load_primitives(obstacles)
     planner.load_simulation(sim, gripper)
+    planner.load_self_collision_checker(selfcc)
 
     start = start_candidate.pose
     goal = target_candidate.pose
@@ -302,8 +356,8 @@ def get_fabric_chunks(
         chunk.append(joint_position.copy())
     final_pose_matrix = kinematics.pose(joint_position, END_EFFECTOR_FRAME).matrix()
     final_pose_xyz = final_pose_matrix[:3, -1]
-    final_pose_q = Quaternion(matrix=final_pose_matrix, atol=1e-5)
-    final_pose = SE3(xyz=final_pose_xyz, quaternion=final_pose_q)
+    final_pose_q = Quaternion(matrix=final_pose_matrix[:3, :3], atol=1e-5)
+    final_pose = SE3(xyz=final_pose_xyz, quaternion=final_pose_q.elements)
     return chunked_trajectory, final_pose
 
 
@@ -357,7 +411,7 @@ def has_self_collision(
                  a self collision)
     """
     for q in trajectory:
-        if selfcc.has_self_collision(q):
+        if selfcc.has_self_collision(q, default_franka_prismatic_joint()):
             return True
     return False
 

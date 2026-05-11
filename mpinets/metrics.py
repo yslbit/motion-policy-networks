@@ -47,6 +47,13 @@ else:
     USE_LULA = True
 
 
+DEFAULT_FRANKA_PRISMATIC_JOINT = 0.025
+
+
+def default_franka_prismatic_joint(robot: Optional[Any] = None) -> float:
+    return getattr(robot, "default_prismatic_value", DEFAULT_FRANKA_PRISMATIC_JOINT)
+
+
 def percent_true(arr: Sequence) -> float:
     """
     Returns the percent true of a boolean sequence or the percent nonzero of a numerical sequence
@@ -263,7 +270,9 @@ class Evaluator:
             self.self_collision_robot.marionette(q)
             if self.self_collision_sim.in_collision(
                 self.self_collision_robot, check_self=True
-            ) or self.selfcc.has_self_collision(q):
+            ) or self.selfcc.has_self_collision(
+                q, default_franka_prismatic_joint(self.self_collision_robot)
+            ):
                 return True
         return False
 

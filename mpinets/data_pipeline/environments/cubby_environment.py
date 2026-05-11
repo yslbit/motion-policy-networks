@@ -22,17 +22,16 @@
 
 from dataclasses import dataclass
 import random
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
-from geometrout.primitive import Cuboid, Cylinder
+from geometrout.primitive import Cuboid, CuboidArray, Cylinder, CylinderArray
 from geometrout.transform import SE3
-from robofin.bullet import Bullet, BulletFranka, BulletFrankaGripper
-from robofin.robots import FrankaGripper, FrankaRobot, FrankaRealRobot
+from robofin.bullet import Bullet, BulletAubo, BulletFranka
+from robofin.robots import FrankaRobot, FrankaRealRobot
+from robofin.robots_aubo import AuboRobot
 from robofin.collision import FrankaSelfCollisionChecker
+from robofin.collision_aubo import AuboCollisionSpheres
 import numpy as np
-from copy import deepcopy
-
-from pyquaternion import Quaternion
 
 from mpinets.data_pipeline.environments.base_environment import (
     TaskOrientedCandidate,
@@ -45,9 +44,8 @@ from mpinets.data_pipeline.environments.base_environment import (
 @dataclass
 class CubbyCandidate(TaskOrientedCandidate):
     """
-    Represents a configuration, its end-effector pose (in right_gripper frame), and
-    some metadata about the cubby (i.e. which cubby pocket it belongs to and the free space
-    inside that cubby)
+    Represents a configuration, its end-effector pose, and some metadata about the cubby
+    (i.e. which cubby pocket it belongs to and the free space inside that cubby).
     """
 
     pocket_idx: int
@@ -59,15 +57,16 @@ class Cubby:
     The actual cubby construction itself, without any robot info.
     """
 
-    def __init__(self):
-        self.cubby_left = radius_sample(0.7, 0.1)
-        self.cubby_right = radius_sample(-0.7, 0.1)
+    def __init__(self, max_reach: float = Environment.FRANKA_MAX_REACH):
+        s = max_reach / Environment.FRANKA_MAX_REACH
+        self.cubby_left = radius_sample(0.7 * s, 0.1 * s)
+        self.cubby_right = radius_sample(-0.7 * s, 0.1 * s)
+        self.cubby_front = radius_sample(0.55 * s, 0.1 * s)
+        self.cubby_back = self.cubby_front + radius_sample(0.35 * s, 0.2 * s)
+        self.cubby_mid_v_y = radius_sample(0.0, 0.1 * s)
         self.cubby_bottom = radius_sample(0.2, 0.1)
-        self.cubby_front = radius_sample(0.55, 0.1)
-        self.cubby_back = self.cubby_front + radius_sample(0.35, 0.2)
         self.cubby_top = radius_sample(0.7, 0.1)
         self.cubby_mid_h_z = radius_sample(0.45, 0.1)
-        self.cubby_mid_v_y = radius_sample(0.0, 0.1)
         self.thickness = radius_sample(0.02, 0.01)
         self.middle_shelf_thickness = self.thickness
         self.center_wall_thickness = self.thickness
@@ -79,7 +78,7 @@ class Cubby:
         Cubbies are essentially represented as unrotated boxes that are then rotated around
         their central yaw axis by `self.in_cabinet_rotation`. This function produces the
         rotation matrix corresponding to that value and axis.
-
+        cabinet_T_world: Transforms from world frame to cabinet frame (where the cabinet is unrotated and centered at the origin)
         :rtype np.ndarray: The rotation matrix
         """
         cabinet_T_world = np.array(
@@ -239,7 +238,6 @@ class Cubby:
     def cuboids(self) -> List[Cuboid]:
         """
         Returns the cuboids that make up the cubby
-
         :rtype List[Cuboid]: The cuboids that make up each section of the cubby
         """
         cuboids: List[Cuboid] = []
@@ -256,11 +254,8 @@ class Cubby:
                     ]
                 ),
             )
-            center = new_matrix[:3, 3]
-            quat = Quaternion(matrix=new_matrix)
-            cuboids.append(
-                Cuboid(center, cuboid.dims, quaternion=[quat.w, quat.x, quat.y, quat.z])
-            )
+            pose = SE3.from_matrix(new_matrix)
+            cuboids.append(Cuboid(pose.xyz, cuboid.dims, quaternion=pose.so3.wxyz))
         return cuboids
 
     @property
@@ -426,34 +421,137 @@ class Cubby:
         for c, d in zip(centers, dims):
             unrotated_pose = np.eye(4)
             unrotated_pose[:3, 3] = c
-            pose = SE3(np.matmul(self.rotation_matrix, unrotated_pose))
+            pose = SE3.from_matrix(np.matmul(self.rotation_matrix, unrotated_pose))
             volumes.append(Cuboid(center=pose.xyz, dims=d, quaternion=pose.so3.wxyz))
         return volumes
 
 
 class CubbyEnvironment(Environment):
-    def __init__(self):
+    def __init__(self, max_reach: float = Environment.FRANKA_MAX_REACH):
         super().__init__()
+        self.max_reach = max_reach
         self.demo_candidates = []
-        pass
 
-    def _gen(self, selfcc: FrankaSelfCollisionChecker) -> bool:
+    def gen_scene(self, **kwargs) -> bool:
+        self.cubby = Cubby(max_reach=self.max_reach)
+        self.generated = True
+        return True
+
+    def _uses_aubo(self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]) -> bool:
+        return isinstance(selfcc, AuboCollisionSpheres)
+
+    def _eef_frame(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> str:
+        return "wrist3_Link" if self._uses_aubo(selfcc) else "right_gripper"
+
+    def _default_prismatic_joint(self, arm: Union[BulletFranka, BulletAubo]) -> float:
+        return getattr(arm, "default_prismatic_value", 0.025)
+
+    def _build_primitive_arrays(self) -> List[Any]:
+        primitive_arrays: List[Any] = []
+        cuboids = self.cuboids
+        cylinders = self.cylinders
+        if cuboids:
+            primitive_arrays.append(CuboidArray(cuboids))
+        if cylinders:
+            primitive_arrays.append(CylinderArray(cylinders))
+        return primitive_arrays
+
+    def _load_planning_arm(
+        self, sim: Bullet, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> Union[BulletFranka, BulletAubo]:
+        if self._uses_aubo(selfcc):
+            return sim.load_robot(BulletAubo)
+        return sim.load_robot(FrankaRobot)
+
+    def _has_self_collision(
+        self,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+        config: np.ndarray,
+        arm: Union[BulletFranka, BulletAubo],
+    ) -> bool:
+        if self._uses_aubo(selfcc):
+            return selfcc.has_self_collision(config)
+        return selfcc.has_self_collision(config, self._default_prismatic_joint(arm))
+
+    def _eef_in_collision(
+        self,
+        pose: SE3,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+        primitive_arrays: List[Any],
+        arm: Union[BulletFranka, BulletAubo],
+    ) -> bool:
+        if self._uses_aubo(selfcc):
+            return selfcc.aubo_eef_collides_fast(
+                pose,
+                primitive_arrays,
+                frame=self._eef_frame(selfcc),
+            )
+        return selfcc.franka_eef_collides_fast(
+            pose,
+            self._default_prismatic_joint(arm),
+            primitive_arrays,
+            frame=self._eef_frame(selfcc),
+        )
+
+    def _collision_free_ik(
+        self,
+        pose: SE3,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+        primitive_arrays: List[Any],
+        arm: Union[BulletFranka, BulletAubo],
+    ) -> Optional[np.ndarray]:
+        if self._uses_aubo(selfcc):
+            return AuboRobot.collision_free_ik(
+                pose,
+                selfcc,
+                primitive_arrays,
+                eff_frame=self._eef_frame(selfcc),
+                retries=1000,
+            )
+        return FrankaRealRobot.collision_free_ik(
+            pose,
+            self._default_prismatic_joint(arm),
+            selfcc,
+            primitive_arrays,
+            eff_frame=self._eef_frame(selfcc),
+            retries=1000,
+        )
+
+    def _random_neutral_config(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> np.ndarray:
+        if self._uses_aubo(selfcc):
+            return AuboRobot.random_neutral()
+        return FrankaRealRobot.random_neutral(method="uniform")
+
+    def _forward_kinematics(
+        self,
+        config: np.ndarray,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+    ) -> SE3:
+        if self._uses_aubo(selfcc):
+            return AuboRobot.fk(config, eff_frame=self._eef_frame(selfcc))
+        return FrankaRealRobot.fk(config, eff_frame=self._eef_frame(selfcc))
+
+    def _gen(self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]) -> bool:
         """
         Generates an environment and a pair of start/end candidates
 
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self collisions using spheres that
+                                                  mimic the internal Franka/Aubo collision checker.
         :rtype bool: Whether the environment was successfully generated
         """
-        self.cubby = Cubby()
+        self.cubby = Cubby(max_reach=self.max_reach)
         support_idxs = np.arange(len(self.cubby.support_volumes))
         random.shuffle(support_idxs)
         supports = self.cubby.support_volumes
 
         sim = Bullet(gui=False)
         sim.load_primitives(self.cubby.cuboids)
-        gripper = sim.load_robot(FrankaGripper)
-        arm = sim.load_robot(FrankaRobot)
+        arm = self._load_planning_arm(sim, selfcc)
+        primitive_arrays = self._build_primitive_arrays()
 
         (
             start_pose,
@@ -467,14 +565,22 @@ class CubbyEnvironment(Environment):
         for ii, idx in enumerate(support_idxs):
             start_support_volume = supports[idx]
             start_pose, start_q = self.random_pose_and_config(
-                sim, gripper, arm, selfcc, start_support_volume
+                sim,
+                arm,
+                selfcc,
+                start_support_volume,
+                primitive_arrays,
             )
             if start_pose is None or start_q is None:
                 continue
             for jdx in support_idxs[ii + 1 :]:
                 target_support_volume = supports[jdx]
                 target_pose, target_q = self.random_pose_and_config(
-                    sim, gripper, arm, selfcc, target_support_volume
+                    sim,
+                    arm,
+                    selfcc,
+                    target_support_volume,
+                    primitive_arrays,
                 )
                 if target_pose is not None and target_q is not None:
                     break
@@ -505,33 +611,34 @@ class CubbyEnvironment(Environment):
     def random_pose_and_config(
         self,
         sim: Bullet,
-        gripper: BulletFrankaGripper,
-        arm: BulletFranka,
-        selfcc: FrankaSelfCollisionChecker,
+        arm: Union[BulletFranka, BulletAubo],
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
         support_volume: Cuboid,
+        primitive_arrays: Optional[List[Any]] = None,
     ) -> Tuple[Optional[SE3], Optional[np.ndarray]]:
         """
         Creates a random end effector pose in the desired support volume and solves for
-        collision free IK
+        collision free IK.
 
         :param sim Bullet: A simulator already loaded with the obstacles
-        :param gripper BulletFrankaGripper: The simulated gripper (necessary for collision
-                                            checking for the pose)
-        :param arm BulletFranka: The simulated arm (necessary for collision checking during
-                                 collision free IK)
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
-                                                  Necessary for collision free IK
+        :param arm Union[BulletFranka, BulletAubo]: The simulated arm used for final collision
+                                                    validation
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self
+                                                                               collisions using
+                                                                               robot-specific
+                                                                               sphere models
         :param support_volume Cuboid: The desired support volume to search inside
         :rtype Tuple[Optional[SE3], Optional[np.ndarray]]: Returns a valid pose and IK solution if
                                                           one is found. Otherwise, returns None, None
         """
+        if primitive_arrays is None:
+            primitive_arrays = self._build_primitive_arrays()
         samples = support_volume.sample_volume(100)
         pose, q = None, None
         for sample in samples:
             theta = radius_sample(0, np.pi / 4)
-            z = np.array([np.cos(theta), np.sin(theta), 0])
-            x = np.array([0, 0, -1])
+            z = np.array([np.cos(theta), np.sin(theta), 0.0], dtype=np.float64)
+            x = np.array([0.0, 0.0, -1.0], dtype=np.float64)
             y = np.cross(z, x)
             pose = SE3.from_unit_axes(
                 origin=sample,
@@ -539,43 +646,47 @@ class CubbyEnvironment(Environment):
                 y=y,
                 z=z,
             )
-            gripper.marionette(pose)
-            if sim.in_collision(gripper):
+            if self._eef_in_collision(pose, selfcc, primitive_arrays, arm):
                 pose = None
                 continue
-            q = FrankaRealRobot.collision_free_ik(sim, arm, selfcc, pose, retries=1000)
-            if q is not None:
-                break
+            q = self._collision_free_ik(pose, selfcc, primitive_arrays, arm)
+            if q is None:
+                pose = None
+                continue
+            arm.marionette(q)
+            if sim.in_collision(arm, check_self=True):
+                pose, q = None, None
+                continue
+            break
         return pose, q
 
     def _gen_neutral_candidates(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[NeutralCandidate]:
         """
         Generates a set of neutral candidates (all collision free)
 
         :param how_many int: How many to generate ideally--can be less if there are a lot of failures
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self
+                                                  collisions using robot-specific sphere models.
         :rtype List[NeutralCandidate]: A list of neutral candidates
         """
         sim = Bullet(gui=False)
-        gripper = sim.load_robot(FrankaGripper)
-        arm = sim.load_robot(FrankaRobot)
+        arm = self._load_planning_arm(sim, selfcc)
         sim.load_primitives(self.obstacles)
+        primitive_arrays = self._build_primitive_arrays()
         candidates: List[NeutralCandidate] = []
         for _ in range(how_many * 50):
             if len(candidates) >= how_many:
                 break
-            sample = FrankaRealRobot.random_neutral(method="uniform")
+            sample = self._random_neutral_config(selfcc)
             arm.marionette(sample)
             if not (
                 sim.in_collision(arm, check_self=True)
-                or selfcc.has_self_collision(sample)
+                or self._has_self_collision(selfcc, sample, arm)
             ):
-                pose = FrankaRealRobot.fk(sample, eff_frame="right_gripper")
-                gripper.marionette(pose)
-                if not sim.in_collision(gripper):
+                pose = self._forward_kinematics(sample, selfcc)
+                if not self._eef_in_collision(pose, selfcc, primitive_arrays, arm):
                     candidates.append(
                         NeutralCandidate(
                             config=sample,
@@ -586,7 +697,7 @@ class CubbyEnvironment(Environment):
         return candidates
 
     def _gen_additional_candidate_sets(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[List[TaskOrientedCandidate]]:
         """
         Creates additional candidates, where the candidates correspond to the support volumes
@@ -594,8 +705,8 @@ class CubbyEnvironment(Environment):
 
         :param how_many int: How many candidates to generate in each support volume (the result is guaranteed
                              to match this number or the function will run forever)
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self
+                                                  collisions using robot-specific sphere models.
         :rtype List[List[TaskOrientedCandidate]]: A pair of candidate sets, where each has `how_many`
                                       candidates that matches the corresponding support volume
                                       for the respective element in `self.demo_candidates`
@@ -603,16 +714,20 @@ class CubbyEnvironment(Environment):
         candidate_sets = []
 
         sim = Bullet(gui=False)
-        gripper = sim.load_robot(FrankaGripper)
-        arm = sim.load_robot(FrankaRobot)
+        arm = self._load_planning_arm(sim, selfcc)
         sim.load_primitives(self.obstacles)
+        primitive_arrays = self._build_primitive_arrays()
 
         for idx, candidate in enumerate(self.demo_candidates):
             candidate_set: List[TaskOrientedCandidate] = []
             ii = 0
             while ii < how_many:
                 pose, q = self.random_pose_and_config(
-                    sim, gripper, arm, selfcc, candidate.support_volume
+                    sim,
+                    arm,
+                    selfcc,
+                    candidate.support_volume,
+                    primitive_arrays,
                 )
                 if pose is not None and q is not None:
                     candidate_set.append(
@@ -663,12 +778,12 @@ class MergedCubbyEnvironment(CubbyEnvironment):
     to create an unobstructed path between the start and goal.
     """
 
-    def gen(self, selfcc: FrankaSelfCollisionChecker) -> bool:
+    def gen(self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]) -> bool:
         """
         Generates an environment and a pair of start/end candidates
 
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self
+                                                  collisions using robot-specific sphere models.
         :rtype bool: Whether the environment was successfully generated
         """
         success = super().gen(selfcc)

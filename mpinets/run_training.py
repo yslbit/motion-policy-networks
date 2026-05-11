@@ -107,7 +107,7 @@ def setup_trainer(
         enable_checkpointing=should_checkpoint,
         callbacks=callbacks,
         max_epochs=1 if test else 500,
-        gradient_clip_val=1.0,
+        gradient_clip_val=1.0, # 梯度裁剪
         gpus=gpus,
         precision=16,
         logger=False if logger is None else logger,

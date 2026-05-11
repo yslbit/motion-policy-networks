@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from geometrout.transform import SE3
 import numpy as np
 from mpinets.mpinets_types import Obstacles
+from robofin.collision_aubo import AuboCollisionSpheres
 
 
 def radius_sample(center: float, radius: float):
@@ -76,6 +77,11 @@ class NeutralCandidate(Candidate):
 
 
 class Environment(ABC):
+    # Default max reach in meters (Franka Panda).  Subclasses should accept
+    # a ``max_reach`` constructor argument so that callers can override this
+    # for robots with a different workspace (e.g. Aubo i3H ≈ 0.72 m).
+    FRANKA_MAX_REACH = 0.855
+
     def __init__(self):
         self.generated = False
         self.demo_candidates = []
@@ -108,13 +114,13 @@ class Environment(ABC):
         """
         pass
 
-    def gen(self, selfcc: FrankaSelfCollisionChecker, **kwargs: Any) -> bool:
+    def gen(self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres], **kwargs: Any) -> bool:
         """
         Generates an environment and a pair of start/end candidates
 
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
-        :rtype bool: Whether the environment was successfully generated
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self collisions using spheres that
+                                                    mimic the internal Franka/Aubo collision checker.
+            :rtype bool: Whether the environment was successfully generated
         """
         self.generated = self._gen(selfcc, **kwargs)
         if self.generated:
@@ -124,7 +130,7 @@ class Environment(ABC):
         return self.generated
 
     def gen_additional_candidate_sets(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[List[TaskOrientedCandidate]]:
         """
         This creates two sets of `how_many` candidates that
@@ -133,8 +139,8 @@ class Environment(ABC):
 
         :param how_many int: How many candidates to generate in each candidate set (the result
                              is guaranteed to match this number or the function will run forever)
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self collisions using spheres that
+                                                  mimic the internal Franka/Aubo collision checker.
         :rtype List[List[TaskOrientedCandidate]]: A list of candidate sets, where each has `how_many`
                                       candidates on the table.
         """
@@ -144,15 +150,15 @@ class Environment(ABC):
         return self._gen_additional_candidate_sets(how_many, selfcc)
 
     def gen_neutral_candidates(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[NeutralCandidate]:
         """
         Generate a set of collision free neutral poses and corresponding configurations
         (represented as Candidate object)
 
         :param how_many int: How many neutral poses to generate
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self collisions using spheres that
+                                                  mimic the internal Franka/Aubo collision checker.
         :rtype List[NeutralCandidate]: A list of neutral poses
         """
         assert (
@@ -161,19 +167,19 @@ class Environment(ABC):
         return self._gen_neutral_candidates(how_many, selfcc)
 
     @abstractmethod
-    def _gen(self, selfcc: FrankaSelfCollisionChecker) -> bool:
+    def _gen(self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]) -> bool:
         """
         The internal implementation of the gen function.
 
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self collisions using spheres that
+                                                  mimic the internal Franka/Aubo collision checker.
         :rtype bool: Whether the environment was successfully generated
         """
         pass
 
     @abstractmethod
     def _gen_additional_candidate_sets(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[List[TaskOrientedCandidate]]:
         """
         This creates two sets of `how_many` candidates that
@@ -182,8 +188,8 @@ class Environment(ABC):
 
         :param how_many int: How many candidates to generate in each candidate set (the result
                              is guaranteed to match this number or the function will run forever)
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self collisions using spheres that
+                                                  mimic the internal Franka/Aubo collision checker.
         :rtype List[List[TaskOrientedCandidate]]: A list of candidate sets, where each has `how_many`
                                       candidates on the table.
         """
@@ -191,15 +197,15 @@ class Environment(ABC):
 
     @abstractmethod
     def _gen_neutral_candidates(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[NeutralCandidate]:
         """
         Generate a set of collision free neutral poses and corresponding configurations
         (represented as NeutralCandidate object)
 
         :param how_many int: How many neutral poses to generate
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self collisions using spheres that
+                                                  mimic the internal Franka/Aubo collision checker.
         :rtype List[NeutralCandidate]: A list of neutral poses
         """
         pass

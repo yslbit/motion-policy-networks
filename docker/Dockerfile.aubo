@@ -1,0 +1,113 @@
+# Dockerfile.aubo
+#
+# Data-generation image for the Aubo i3H variant of Motion Policy Networks.
+# Base: pytorch/pytorch:2.5.1-cuda11.8-cudnn9-runtime  (Ubuntu 22.04, Python 3.11)
+#
+# OMPL 1.7.0 is installed via pip (pre-compiled wheel for Python 3.11).
+# All third-party libraries are installed from the local source tree.
+#
+# Build (from repository root):
+#   docker build -f docker/Dockerfile.aubo -t mpinets-aubo:latest .
+#
+# Run (interactive):
+#   docker run --gpus all --rm -it \
+#     -v $(pwd)/data:/data \
+#     mpinets-aubo:latest bash
+#
+# Generate data (tabletop, test run):
+#   docker run --gpus all --rm \
+#     -v $(pwd)/data/output:/data \
+#     mpinets-aubo:latest \
+#     python -m mpinets.data_pipeline.gen_data_aubo tabletop test-pipeline /data
+
+FROM pytorch/pytorch:2.5.1-cuda11.8-cudnn9-runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ──────────────────────────────────────────────────────────────────────────────
+# System packages
+#   build-essential cmake: compile ikfast_pybind_aubo from C++ source
+#   liblapack-dev libblas-dev: ikfast CMake find_package(LAPACK)
+#   libgl1 libglib2.0-0: headless pybullet (DIRECT mode)
+# ──────────────────────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git wget curl \
+        liblapack-dev libblas-dev \
+        libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Python runtime packages
+# ompl==1.7.0 provides pre-compiled Python 3.11 bindings (cp311 wheel).
+# ──────────────────────────────────────────────────────────────────────────────
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir \
+        ompl==1.7.0 \
+        numpy \
+        h5py \
+        trimesh \
+        ipython \
+        pybullet \
+        pyquaternion \
+        tqdm \
+        urchin==0.0.30 \
+        yourdfpy \
+        shapely \
+        rtree \
+        triangle \
+        termcolor \
+        numba \
+        six \
+        lxml \
+        scipy \
+        pycollada \
+        networkx
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Local third-party packages (copied from build context = repo root).
+# Keep the install path aligned with the repository layout so a bind mount of
+# the whole project to /workspace does not invalidate editable installs.
+# ──────────────────────────────────────────────────────────────────────────────
+WORKDIR /workspace
+
+COPY mpinets/third_party/geometrout         /workspace/mpinets/third_party/geometrout
+COPY mpinets/third_party/robofin            /workspace/mpinets/third_party/robofin
+COPY mpinets/third_party/atob-aubo          /workspace/mpinets/third_party/atob-aubo
+COPY mpinets/third_party/ikfast_pybind_aubo /workspace/mpinets/third_party/ikfast_pybind_aubo
+
+# Install ikfast_pybind FIRST so that robofin's "ikfast-pybind" dep is satisfied
+# by our local CMake build (pybind11 v2.13.6, Python 3.11-compatible).
+# --no-build-isolation: makes numpy/setuptools from conda env visible to setup.py.
+RUN pip install --no-cache-dir -e /workspace/mpinets/third_party/geometrout \
+ && pip install --no-cache-dir -e /workspace/mpinets/third_party/atob-aubo \
+ && cd /workspace/mpinets/third_party/ikfast_pybind_aubo \
+ && pip install --no-cache-dir --no-build-isolation -e . \
+ && pip install --no-cache-dir -e /workspace/mpinets/third_party/robofin
+
+# Main mpinets package
+COPY setup.cfg pyproject.toml /workspace/
+COPY mpinets /workspace/mpinets
+COPY mpinets/run_training_aubo.py jobconfig_aubo.yaml /workspace/
+RUN pip install --no-cache-dir -e /workspace
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Final env
+# ──────────────────────────────────────────────────────────────────────────────
+ENV DISPLAY=""
+ENV MPLBACKEND=Agg
+# The ikfast_pybind editable install uses a PEP 660 path finder that maps
+# subdirectory names but misses root-level compiled .so files (e.g.
+# ikfast_aubo_i3H.cpython-311.so).  Adding the package root fixes the import.
+ENV PYTHONPATH="/workspace/mpinets/third_party/ikfast_pybind_aubo"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pre-compile numba JIT functions so containers start fast.
+# All @nb.jit(cache=True) functions are compiled once here and baked into the
+# image layer; subsequent container runs skip recompilation entirely.
+# ──────────────────────────────────────────────────────────────────────────────
+COPY docker/warmup_numba.py /tmp/warmup_numba.py
+RUN python3 /tmp/warmup_numba.py
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["bash"]

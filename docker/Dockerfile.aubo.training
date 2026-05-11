@@ -1,0 +1,90 @@
+# Dockerfile.aubo.training
+#
+# Training image for the Aubo i3H variant of Motion Policy Networks.
+# Extends mpinets:latest (which already has pytorch-lightning, pointnet2_ops,
+# CUDA-compiled libs, etc.) with Aubo-specific data-pipeline code.
+#
+# Prerequisite: build the base image first:
+#   docker build -f docker/Dockerfile -t mpinets:latest .
+#
+# Build (from repository root):
+#   docker build -f docker/Dockerfile.aubo.training -t mpinets-aubo-training:latest .
+#
+# Split data (one-time):
+#   docker run --rm \
+#     -v /path/to/all_data.hdf5:/data_in/all_data.hdf5 \
+#     -v /path/to/split_dir:/data_out \
+#     mpinets-aubo-training:latest \
+#     python /workspace/run_training_aubo.py --split-data /data_in/all_data.hdf5 /data_out
+#
+# Run training:
+#   docker run --gpus all --rm \
+#     -v /path/to/split_dir:/data \
+#     -v /path/to/checkpoints:/checkpoints \
+#     mpinets-aubo-training:latest \
+#     python /workspace/run_training_aubo.py /workspace/jobconfig_aubo.yaml
+#
+# Precompute point-cloud cache:
+#   docker run --gpus all --rm \
+#     -v /path/to/split_dir:/data \
+#     mpinets-aubo-training:latest \
+#     python /workspace/scripts/precompute_point_cloud_cache.py /data/val/val.hdf5 \
+#       --trajectory-key hybrid_solutions \
+#       --num-obstacle-points 1024 \
+#       --num-target-points 64
+
+FROM mpinets:latest
+
+WORKDIR /workspace
+
+# mpinets:latest has python2.7 as the default 'python'; override with python3.
+RUN ln -sf /usr/bin/python3 /usr/local/bin/python
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libblas-dev \
+        liblapack-dev \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install Aubo-specific Python deps needed for training and cache precompute.
+# ompl is only needed for hybrid data generation and is intentionally left out.
+RUN pip install --no-cache-dir \
+        numba \
+        pycollada \
+        yourdfpy \
+        pyquaternion
+
+# Copy Aubo third-party libraries. Keep the install path aligned with the
+# repository layout so a bind mount of the whole project to /workspace does not
+# invalidate editable installs.
+COPY mpinets/third_party/geometrout         /workspace/mpinets/third_party/geometrout
+COPY mpinets/third_party/robofin            /workspace/mpinets/third_party/robofin
+COPY mpinets/third_party/atob-aubo          /workspace/mpinets/third_party/atob-aubo
+COPY mpinets/third_party/ikfast_pybind_aubo /workspace/mpinets/third_party/ikfast_pybind_aubo
+
+# Install ikfast before robofin because robofin imports the generated Aubo
+# extension module for FK/IK.
+RUN pip install --no-cache-dir -e /workspace/mpinets/third_party/geometrout \
+ && pip install --no-cache-dir -e /workspace/mpinets/third_party/atob-aubo \
+ && cd /workspace/mpinets/third_party/ikfast_pybind_aubo \
+ && rm -rf build ikfast_pybind.egg-info *.so \
+ && pip install --no-cache-dir --no-build-isolation -e . \
+ && pip install --no-cache-dir --no-build-isolation --no-deps -e /workspace/mpinets/third_party/robofin
+
+# Copy main mpinets package (overrides whatever is in the base image)
+COPY setup.cfg pyproject.toml /workspace/
+COPY mpinets /workspace/mpinets
+COPY scripts /workspace/scripts
+COPY ./mpinets/run_training_aubo.py ./jobconfig_aubo.yaml /workspace/
+RUN pip install --no-cache-dir -e /workspace
+
+ENV DISPLAY=""
+ENV MPLBACKEND=Agg
+# Editable ikfast installs do not always expose root-level compiled .so files,
+# so add the extension directory explicitly.
+ENV PYTHONPATH="/workspace/mpinets/third_party/ikfast_pybind_aubo"
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["bash"]

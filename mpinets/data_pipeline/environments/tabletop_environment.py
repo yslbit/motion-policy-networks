@@ -21,17 +21,19 @@
 # DEALINGS IN THE SOFTWARE.
 
 from copy import deepcopy
-from typing import List, Union, Optional
+from typing import Any, List, Union, Optional
 import time
 from dataclasses import dataclass
 
 import numpy as np
-from geometrout.primitive import Cuboid, Cylinder
+from geometrout.primitive import Cuboid, CuboidArray, Cylinder, CylinderArray
 from geometrout.transform import SO3, SE3
 
-from robofin.robots import FrankaRobot, FrankaRealRobot, FrankaGripper
-from robofin.bullet import Bullet
+from robofin.robots import FrankaRobot, FrankaRealRobot
+from robofin.robots_aubo import AuboRobot
+from robofin.bullet import Bullet, BulletAubo, BulletFranka
 from robofin.collision import FrankaSelfCollisionChecker
+from robofin.collision_aubo import AuboCollisionSpheres
 
 from mpinets.data_pipeline.environments.base_environment import (
     TaskOrientedCandidate,
@@ -56,8 +58,10 @@ class TabletopEnvironment(Environment):
     table under the robot and some obstacle free space on the tables.
     """
 
-    def __init__(self):
+    def __init__(self, max_reach: float = Environment.FRANKA_MAX_REACH):
         super().__init__()
+        self.max_reach = max_reach
+        self._reach_scale = max_reach / self.FRANKA_MAX_REACH
         self.reset()
 
     def reset(self):
@@ -68,14 +72,121 @@ class TabletopEnvironment(Environment):
         self.tables = []  # The tables with objects on it
         self.clear_tables = []  # The tables without objects
 
-    def _gen(self, selfcc: FrankaSelfCollisionChecker, how_many: int) -> bool:
+    def gen_scene(self, how_many: int = 8) -> bool:
+        self.reset()
+        self.setup_tables()
+        self.place_objects(how_many)
+        self.generated = True
+        return True
+
+    def _uses_aubo(self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]) -> bool:
+        return isinstance(selfcc, AuboCollisionSpheres)
+
+    def _eef_frame(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> str:
+        return "wrist3_Link" if self._uses_aubo(selfcc) else "right_gripper"
+
+    def _default_prismatic_joint(self, arm: Union[BulletFranka, BulletAubo]) -> float:
+        return getattr(arm, "default_prismatic_value", 0.025)
+
+    def _build_primitive_arrays(self) -> List[Any]:
+        primitive_arrays: List[Any] = []
+        cuboids = self.cuboids
+        cylinders = self.cylinders
+        if cuboids:
+            primitive_arrays.append(CuboidArray(cuboids))
+        if cylinders:
+            primitive_arrays.append(CylinderArray(cylinders))
+        return primitive_arrays
+
+    def _load_planning_arm(
+        self, sim: Bullet, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> Union[BulletFranka, BulletAubo]:
+        if self._uses_aubo(selfcc):
+            return sim.load_robot(AuboRobot)
+        return sim.load_robot(FrankaRobot)
+
+    def _has_self_collision(
+        self,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+        config: np.ndarray,
+        arm: Union[BulletFranka, BulletAubo],
+    ) -> bool:
+        if self._uses_aubo(selfcc):
+            return selfcc.has_self_collision(config)
+        return selfcc.has_self_collision(config, self._default_prismatic_joint(arm))
+
+    def _eef_in_collision(
+        self,
+        pose: SE3,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+        primitive_arrays: List[Any],
+        arm: Union[BulletFranka, BulletAubo],
+    ) -> bool:
+        if self._uses_aubo(selfcc):
+            return selfcc.aubo_eef_collides_fast(
+                pose,
+                primitive_arrays,
+                frame=self._eef_frame(selfcc),
+            )
+        return selfcc.franka_eef_collides_fast(
+            pose,
+            self._default_prismatic_joint(arm),
+            primitive_arrays,
+            frame=self._eef_frame(selfcc),
+        )
+
+    def _collision_free_ik(
+        self,
+        pose: SE3,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+        primitive_arrays: List[Any],
+        arm: Union[BulletFranka, BulletAubo],
+    ) -> Optional[np.ndarray]:
+        if self._uses_aubo(selfcc):
+            return AuboRobot.collision_free_ik(
+                pose,
+                selfcc,
+                primitive_arrays,
+                eff_frame=self._eef_frame(selfcc),
+                retries=1000,
+            )
+        return FrankaRealRobot.collision_free_ik(
+            pose,
+            self._default_prismatic_joint(arm),
+            selfcc,
+            primitive_arrays,
+            eff_frame=self._eef_frame(selfcc),
+            retries=1000,
+        )
+
+    def _random_neutral_config(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
+    ) -> np.ndarray:
+        if self._uses_aubo(selfcc):
+            return AuboRobot.random_neutral()
+        return FrankaRealRobot.random_neutral(method="uniform")
+
+    def _forward_kinematics(
+        self,
+        config: np.ndarray,
+        selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres],
+    ) -> SE3:
+        if self._uses_aubo(selfcc):
+            return AuboRobot.fk(config, eff_frame=self._eef_frame(selfcc))
+        return FrankaRealRobot.fk(config, eff_frame=self._eef_frame(selfcc))
+
+    def _gen(
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres], how_many: int
+    ) -> bool:
         """
         Generates the environment and a pair of valid candidates. The environment has a
         object-free table under the robot's base, as well as possibly some object-free
         sections on the table that are outside of the workspace.
 
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self
+                                                  collisions using robot-specific sphere models.
         :param how_many int: How many objects to put on the tables
         :rtype bool: Whether the environment was successfully generated
         """
@@ -94,33 +205,32 @@ class TabletopEnvironment(Environment):
         return True
 
     def _gen_neutral_candidates(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[NeutralCandidate]:
         """
         Generate a set of collision free neutral poses (represented as NeutralCandidate object)
 
         :param how_many int: How many neutral poses to generate
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self
+                                                  collisions using robot-specific sphere models.
         :rtype List[NeutralCandidate]: A list of neutral poses
         """
         sim = Bullet(gui=False)
-        gripper = sim.load_robot(FrankaGripper)
-        arm = sim.load_robot(FrankaRobot)
+        arm = self._load_planning_arm(sim, selfcc)
         sim.load_primitives(self.obstacles)
+        primitive_arrays = self._build_primitive_arrays()
         candidates = []
         for _ in range(how_many * 50):
             if len(candidates) >= how_many:
                 break
-            sample = FrankaRealRobot.random_neutral(method="uniform")
+            sample = self._random_neutral_config(selfcc)
             arm.marionette(sample)
             if not (
                 sim.in_collision(arm, check_self=True)
-                or selfcc.has_self_collision(sample)
+                or self._has_self_collision(selfcc, sample, arm)
             ):
-                pose = FrankaRealRobot.fk(sample, eff_frame="right_gripper")
-                gripper.marionette(pose)
-                if not sim.in_collision(gripper):
+                pose = self._forward_kinematics(sample, selfcc)
+                if not self._eef_in_collision(pose, selfcc, primitive_arrays, arm):
                     candidates.append(
                         NeutralCandidate(config=sample, pose=pose, negative_volumes=[])
                     )
@@ -220,21 +330,22 @@ class TabletopEnvironment(Environment):
         has the tables that can have stuff on them. The `self.clear_tables` will have no objects
         placed on them.
         """
+        s = self._reach_scale
         table_height = np.random.choice(
             (np.random.uniform(0, 0.4), 0.0), p=[0.65, 0.35]
         )
         z = (table_height + -0.02) / 2
         dim_z = table_height + 0.02
         # Setup front table
-        front_x_min = np.random.uniform(0.275, 0.375)
-        front_x_max = np.random.uniform(1.275, 1.375)
-        front_y_max = np.random.uniform(1.5, 1.65)
+        front_x_min = np.random.uniform(0.275 * s, 0.375 * s)
+        front_x_max = np.random.uniform(1.275 * s, 1.375 * s)
+        front_y_max = np.random.uniform(1.5 * s, 1.65 * s)
         has_side_table = np.random.uniform() < 0.5
         if has_side_table:
-            front_y_min = np.random.uniform(-0.75, -1.0)
+            front_y_min = np.random.uniform(-0.75 * s, -1.0 * s)
             pass
         else:
-            front_y_min = np.random.uniform(-0.55, -0.75)
+            front_y_min = np.random.uniform(-0.55 * s, -0.75 * s)
 
         whole_front_table = Cuboid(
             center=[
@@ -270,10 +381,10 @@ class TabletopEnvironment(Environment):
         self.clear_tables = [front_free_table]
 
         if has_side_table:
-            side_y_max = np.random.uniform(-0.275, -0.325)
+            side_y_max = np.random.uniform(-0.275 * s, -0.325 * s)
             side_y_min = min(front_task_table.corners[:, 1])
             side_x_max = min(front_task_table.corners[:, 0])
-            side_x_min = side_x_max - np.random.uniform(0, 1.375)
+            side_x_min = side_x_max - np.random.uniform(0, 1.375 * s)
             whole_side_table = Cuboid(
                 [(side_x_max + side_x_min) / 2, (side_y_max + side_y_min) / 2, z],
                 [side_x_max - side_x_min, side_y_max - side_y_min, dim_z],
@@ -281,7 +392,7 @@ class TabletopEnvironment(Environment):
             )
             side_y = (side_y_max + min(front_task_table.corners[:, 1])) / 2
             side_x = (
-                np.random.uniform(-1.275, -1.375) + min(front_task_table.corners[:, 0])
+                np.random.uniform(-1.275 * s, -1.375 * s) + min(front_task_table.corners[:, 0])
             ) / 2
             corners = whole_side_table.corners
             side_task_table_scalar = np.random.uniform(0.55, 0.65)
@@ -306,8 +417,8 @@ class TabletopEnvironment(Environment):
         mount_table = Cuboid.random(
             center_range=[[-0.02, -0.02, -0.01], [0.02, 0.02, -0.01]],
             dimension_range=[
-                [1, 0.9, 0.02],
-                [1, 0.94, 0.02],
+                [1 * s, 0.9 * s, 0.02],
+                [1 * s, 0.94 * s, 0.02],
             ],
             quaternion=False,
         )
@@ -324,7 +435,7 @@ class TabletopEnvironment(Environment):
         self.clear_tables.append(mount_table)
 
     def _gen_additional_candidate_sets(
-        self, how_many: int, selfcc: FrankaSelfCollisionChecker
+        self, how_many: int, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> List[List[TaskOrientedCandidate]]:
         """
         Problems in the tabletop environment are symmetric, meaning that all candidates
@@ -336,8 +447,8 @@ class TabletopEnvironment(Environment):
 
         :param how_many int: How many candidates to generate in each candidate set (the result
                              is guaranteed to match this number or the function will run forever)
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self
+                                                  collisions using robot-specific sphere models.
         :rtype List[List[TaskOrientedCandidate]]: A list of candidate sets, where each has `how_many`
                                       candidates on the table.
         """
@@ -352,7 +463,7 @@ class TabletopEnvironment(Environment):
         return candidate_sets
 
     def gen_candidate(
-        self, selfcc: FrankaSelfCollisionChecker
+        self, selfcc: Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]
     ) -> Optional[TaskOrientedCandidate]:
         """
         Generates a valid, collision-free end effector pose (according to this
@@ -361,16 +472,16 @@ class TabletopEnvironment(Environment):
         They are densely distributed close to the surface and less frequently further
         above the table.
 
-        :param selfcc FrankaSelfCollisionChecker: Checks for self collisions using spheres that
-                                                  mimic the internal Franka collision checker.
+        :param selfcc Union[FrankaSelfCollisionChecker, AuboCollisionSpheres]: Checks for self
+                                                  collisions using robot-specific sphere models.
         :rtype TaskOrientedCandidate: A valid candidate
         :raises Exception: Raises an exception if there are unsupported objects on the table
         """
         points = self.random_points_on_table(100)
         sim = Bullet(gui=False)
         sim.load_primitives(self.obstacles)
-        gripper = sim.load_robot(FrankaGripper)
-        arm = sim.load_robot(FrankaRobot)
+        arm = self._load_planning_arm(sim, selfcc)
+        primitive_arrays = self._build_primitive_arrays()
         q = None
         pose = None
         for p in points:
@@ -388,13 +499,18 @@ class TabletopEnvironment(Environment):
             pitch = np.random.uniform(-np.pi / 8, np.pi / 8)
             yaw = np.random.uniform(-np.pi / 2, np.pi / 2)
             pose = SE3(xyz=p, so3=SO3.from_rpy(roll, pitch, yaw))
-            gripper.marionette(pose)
-            if sim.in_collision(gripper):
+            if self._eef_in_collision(pose, selfcc, primitive_arrays, arm):
                 pose = None
                 continue
-            q = FrankaRealRobot.collision_free_ik(sim, arm, selfcc, pose, retries=1000)
-            if q is not None:
-                break
+            q = self._collision_free_ik(pose, selfcc, primitive_arrays, arm)
+            if q is None:
+                pose = None
+                continue
+            arm.marionette(q)
+            if sim.in_collision(arm, check_self=True):
+                pose, q = None, None
+                continue
+            break
         if pose is None or q is None:
             return None
         return TaskOrientedCandidate(

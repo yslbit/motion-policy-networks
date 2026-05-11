@@ -24,7 +24,7 @@ import numpy as np
 from tqdm.auto import tqdm, trange
 import h5py
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from argparse import ArgumentParser, RawTextHelpFormatter
 import sys
 
@@ -132,7 +132,7 @@ def extract_hybrid_expert_data(input_file: str, output_file: str):
     """
     with h5py.File(input_file) as g:
         hybrid_indices = np.nonzero(
-            ~np.all(g["hybrid_solutions"] == np.zeros((50, 7)), axis=(1, 2))
+            ~np.all(g["hybrid_solutions"] == np.zeros((50, 6)), axis=(1, 2)) # check if changing robot
         )[0]
         N = len(hybrid_indices)
         print(f"Found {N} hybrid demonstrations")
@@ -145,7 +145,11 @@ def extract_hybrid_expert_data(input_file: str, output_file: str):
 
 
 def downsize_and_split(
-    input_file: str, output_dir: str, train_size: int, val_size: int, test_size: int
+    input_file: str,
+    output_dir: str,
+    train_size: Optional[int],
+    val_size: Optional[int],
+    test_size: Optional[int],
 ):
     """
     This function is meant to be used to regularize the sizes of individual problem types
@@ -163,9 +167,21 @@ def downsize_and_split(
     :param test_size int: The size of the test dataset
     """
     with h5py.File(input_file) as f:
-        assert train_size + val_size + test_size < len(f["cuboid_centers"])
+        total_trajectories = len(f["cuboid_centers"])
+
+        if train_size is None:
+            if val_size is not None or test_size is not None:
+                raise ValueError(
+                    "When train_size is None, val_size and test_size should also be None"
+                )
+            val_size = total_trajectories // 10
+            test_size = total_trajectories // 10
+            train_size = total_trajectories - val_size - test_size
+
+        assert val_size is not None and test_size is not None
+        assert train_size + val_size + test_size <= total_trajectories
         indices = np.random.choice(
-            np.arange(len(f["cuboid_centers"])),
+            np.arange(total_trajectories),
             size=train_size + test_size + val_size,
             replace=False,
         )
@@ -336,16 +352,22 @@ if __name__ == "__main__":
     downsize_parser.add_argument(
         "train_size",
         type=int,
+        nargs="?",
+        default=None,
         help="The size of the training dataset (must be less than the full dataset)",
     )
     downsize_parser.add_argument(
         "val_size",
         type=int,
+        nargs="?",
+        default=None,
         help="The size of the validation dataset (must be less than the full dataset)",
     )
     downsize_parser.add_argument(
         "test_size",
         type=int,
+        nargs="?",
+        default=None,
         help="The size of the test dataset (must be less than the full dataset)",
     )
 

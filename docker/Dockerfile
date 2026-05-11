@@ -63,21 +63,28 @@ RUN apt update \
     curl \
     ninja-build \
   && apt-get clean \
-  && rm -rf /var/lib/apt
+  && rm -rf /var/lib/apt/lists/*
 
 # RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.6 1 \
 #   && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.7 2 \
 #   && update-alternatives --set python3 /usr/bin/python3.7 \
 #   && curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py \
 #   && python3.7 get-pip.py
-RUN rm /usr/bin/python3 && ln -s python3.7 /usr/bin/python3 \
-  && curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py \
+RUN ln -sf /usr/bin/python3.7 /usr/bin/python3 \
+  && curl -sS https://bootstrap.pypa.io/pip/3.7/get-pip.py -o get-pip.py \
   && python3.7 get-pip.py
 
 # Clone repos necessary to build OMPL and build it against the Python 3.7
 RUN python3 -m pip install -vU https://github.com/CastXML/pygccxml/archive/develop.zip pyplusplus numpy \
- && wget -q -O- https://data.kitware.com/api/v1/file/5e8b740d2660cbefba944189/download | tar zxf - -C ${HOME} \
- && wget -O - https://github.com/ompl/ompl/archive/1.5.2.tar.gz | tar zxf - \
+ && wget --tries=5 --waitretry=3 --read-timeout=30 --timeout=30 \
+   -O /tmp/castxml.tar.gz \
+   https://data.kitware.com/api/v1/file/5e8b740d2660cbefba944189/download \
+ && tar zxf /tmp/castxml.tar.gz -C ${HOME} \
+ && wget --tries=5 --waitretry=3 --read-timeout=30 --timeout=30 \
+   -O /tmp/ompl-1.5.2.tar.gz \
+   https://github.com/ompl/ompl/archive/1.5.2.tar.gz \
+ && tar zxf /tmp/ompl-1.5.2.tar.gz \
+ && rm -f /tmp/castxml.tar.gz /tmp/ompl-1.5.2.tar.gz \
  && export CXX=g++ \
  && export MAKEFLAGS="-j `nproc`" \
  && export PATH=${HOME}/castxml/bin:${PATH} \
@@ -93,6 +100,11 @@ RUN python3 -m pip install -vU https://github.com/CastXML/pygccxml/archive/devel
 # adding the standard site-packages back into the PYTHONPATH (because it appears to be
 # the default installation path for OMPL)
 ENV PYTHONPATH=/isaac-sim/exts/omni.isaac.lula/pip_prebundle/:/usr/lib/python3.7/site-packages
+
+# Local third-party packages bundled with this repo
+COPY mpinets/third_party/geometrout /root/third_party/geometrout
+COPY mpinets/third_party/robofin /root/third_party/robofin
+COPY mpinets/third_party/atob-aubo /root/third_party/atob-aubo
 
 # Section 2. Install Learning Tools (Cuda, Python Dependencies)
 # Install cuda 11.3 (this should be upgraded if Pytorch is also upgraded)
@@ -119,8 +131,9 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86
     libnccl-dev=2.9.9-1+cuda11.3 \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:${PATH}
-ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+ENV PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:${PATH}
+ARG LD_LIBRARY_PATH=
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
 
 # Keep apt from auto upgrading the cublas and nccl packages. See https://gitlab.com/nvidia/container-images/cuda/-/issues/88
 RUN apt-mark hold libcublas-11-3 libnccl2 libcublas-dev-11-3 libnccl-dev
@@ -129,59 +142,126 @@ RUN apt-mark hold libcublas-11-3 libnccl2 libcublas-dev-11-3 libnccl-dev
 # Install Python dependencies for Motion Policy Networks
 # For some reason, the ikfast dependency do not get properly installed if
 # ikfast and robofin are in the same pip install statement
-RUN python3 -m pip install --upgrade pip setuptools \
-  && python3 -m pip install \
-    torch --extra-index-url https://download.pytorch.org/whl/cu113 \
-    pytorch_lightning \
+RUN set -eux; \
+  export PIP_DEFAULT_TIMEOUT=120; \
+  retry_cmd() { \
+    attempts=0; \
+    max_attempts=3; \
+    while true; do \
+      if "$@"; then \
+        break; \
+      fi; \
+      attempts=$((attempts + 1)); \
+      if [ "$attempts" -ge "$max_attempts" ]; then \
+        return 1; \
+      fi; \
+      sleep 10; \
+    done; \
+  }; \
+  retry_cmd python3 -m pip install --upgrade pip setuptools; \
+  retry_cmd python3 -m pip install \
+    'torch<2' --extra-index-url https://download.pytorch.org/whl/cu113 \
+    'pytorch_lightning<2' \
     h5py \
     trimesh \
     wandb \
     ipython \
     pybullet \
     pyquaternion \
-    geometrout==0.0.3.4 \
-    ikfast-pybind  \
+    ikfast-pybind \
+    numba \
     tqdm \
-    urchin==0.0.24 \
+    urchin \
     yourdfpy \
     shapely \
     rtree \
     triangle \
     termcolor \
-    meshcat \
-    git+https://github.com/fishbotics/pointnet2_ops.git@v3.2.0 \
-  && python3 -m pip install git+https://github.com/fishbotics/robofin.git@v0.0.1 git+https://github.com/fishbotics/atob@v0.0.1
+    meshcat; \
+  retry_cmd python3 -m pip install \
+    git+https://github.com/fishbotics/pointnet2_ops.git@v3.2.0; \
+  python3 -m pip install --no-build-isolation --no-deps -e /root/third_party/geometrout; \
+  python3 -m pip install --no-build-isolation --no-deps -e /root/third_party/robofin; \
+  python3 -m pip install --no-build-isolation --no-deps -e /root/third_party/atob-aubo
 
 # Section 3. Install ROS dependencies for the interactive tutorial
-RUN ln -fs /usr/share/zoneinfo/America/Los_Angeles /etc/localtime \
-  && echo "America/Los_Angeles" > /etc/timezone \
-  && apt update \
-  && apt install -y --no-install-recommends \
-  curl \
-  gnupg \
-  && apt-get clean \
-  && rm -rf /var/lib/apt \
-  && sh -c 'echo "deb http://packages.ros.org/ros/ubuntu bionic main" > /etc/apt/sources.list.d/ros-latest.list' \
-  && curl -s https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | apt-key add - \
-  && apt update && apt install -y --no-install-recommends \
-    ros-melodic-desktop-full \
-    python-rosdep \
-    python-rosinstall \
-    python-rosinstall-generator \
-    python-wstool \
-    ros-melodic-catkin \
-    python-catkin-tools \
-    ros-melodic-moveit \
-    ros-melodic-moveit-python \
-    ros-melodic-franka-ros \
-    ros-melodic-tf2-ros \
-    python3-rospkg-modules \
-    python3-catkin-pkg-modules \
-  && apt-get clean \
-  && rm -rf /var/lib/apt \
-  && echo "source /opt/ros/melodic/setup.bash" >> ~/.bashrc \
-  && rosdep init && rosdep update \
-  && python3 -m pip install rospkg netifaces
+# Disabled by default because ROS Melodic is EOL and this large apt layer is
+# both slow and brittle. Enable with `--build-arg INSTALL_ROS=1` when needed.
+ARG INSTALL_ROS=0
+RUN if [ "$INSTALL_ROS" = "1" ]; then \
+    set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    APT_FETCH_OPTS="-o Acquire::Retries=10 -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=120 -o Acquire::https::Timeout=120"; \
+    retry_apt_install() { \
+      attempts=0; \
+      max_attempts=3; \
+      while true; do \
+        if apt-get ${APT_FETCH_OPTS} install "$@"; then \
+          break; \
+        fi; \
+        attempts=$((attempts + 1)); \
+        if [ "$attempts" -ge "$max_attempts" ]; then \
+          return 1; \
+        fi; \
+        apt-get clean; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep 15; \
+        apt-get ${APT_FETCH_OPTS} update; \
+      done; \
+    }; \
+    retry_cmd() { \
+      attempts=0; \
+      max_attempts=3; \
+      while true; do \
+        if "$@"; then \
+          break; \
+        fi; \
+        attempts=$((attempts + 1)); \
+        if [ "$attempts" -ge "$max_attempts" ]; then \
+          return 1; \
+        fi; \
+        sleep 5; \
+      done; \
+    }; \
+    ln -fs /usr/share/zoneinfo/America/Los_Angeles /etc/localtime \
+    && echo "America/Los_Angeles" > /etc/timezone \
+    && apt-get ${APT_FETCH_OPTS} update \
+    && retry_apt_install -y --no-install-recommends \
+      curl \
+      dirmngr \
+      gnupg \
+      ca-certificates \
+      apt-transport-https \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && sh -c 'echo "deb http://snapshots.ros.org/melodic/2023-06-27/ubuntu bionic main" > /etc/apt/sources.list.d/ros-latest.list' \
+    && retry_cmd apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 4B63CF8FDE49746E98FA01DDAD19BAB3CBF125EA \
+    && apt-get ${APT_FETCH_OPTS} update \
+    && retry_apt_install -y --no-install-recommends --fix-missing \
+      ros-melodic-desktop-full \
+      python-rosdep \
+      python-rosinstall \
+      python-rosinstall-generator \
+      python-wstool \
+      ros-melodic-catkin \
+      python-catkin-tools \
+      ros-melodic-moveit \
+      ros-melodic-moveit-python \
+      ros-melodic-franka-ros \
+      ros-melodic-tf2-ros \
+      python3-rospkg-modules \
+      python3-catkin-pkg-modules \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "source /opt/ros/melodic/setup.bash" >> ~/.bashrc \
+    && if ! retry_cmd rosdep init && ! test -f /etc/ros/rosdep/sources.list.d/20-default.list; then \
+         echo "Warning: rosdep init timed out during image build; continuing without preinitialized rosdep sources."; \
+       fi \
+    && if ! retry_cmd rosdep update --include-eol-distros; then \
+         echo "Warning: rosdep update timed out during image build; you can rerun it later inside the container."; \
+       fi \
+    && python3 -m pip install rospkg netifaces ; \
+  fi
 
 ENV ROS_HOSTNAME=localhost
 ENV ROS_MASTER_URI=http://localhost:11311

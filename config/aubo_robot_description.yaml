@@ -1,0 +1,64 @@
+api_version: 1.0
+
+# Aubo i3 robot description for MPiNets
+# 6-DOF collaborative robot, no gripper
+# EEF frame: wrist3_Link
+
+c_space:
+  joint_names:
+    - shoulder_joint
+    - upperArm_joint
+    - foreArm_joint
+    - wrist1_joint
+    - wrist2_joint
+    - wrist3_joint
+  acceleration_limits: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+  jerk_limits: [500.0, 500.0, 500.0, 500.0, 500.0, 500.0]
+
+default_q: [-0.03, -0.46, 1.5, 0.92, 0.2, 0.0]
+
+root_link: base_link
+subtree_root: base_link
+
+# Approximate collision spheres for each link
+# Format: [center_x, center_y, center_z, radius]
+collision_spheres:
+  base_link:
+    - center: [0.0, 0.0, 0.08]
+      radius: 0.08
+  shoulder_Link:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.07
+    - center: [0.0, 0.06, 0.0]
+      radius: 0.07
+  upperArm_Link:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.07
+    - center: [0.08, 0.0, 0.0]
+      radius: 0.07
+    - center: [0.16, 0.0, 0.0]
+      radius: 0.07
+    - center: [0.24, 0.0, 0.0]
+      radius: 0.07
+  foreArm_Link:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.06
+    - center: [0.08, 0.0, 0.0]
+      radius: 0.06
+    - center: [0.16, 0.0, 0.0]
+      radius: 0.06
+    - center: [0.24, 0.0, 0.0]
+      radius: 0.06
+  wrist1_Link:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.05
+    - center: [0.05, 0.0, 0.0]
+      radius: 0.05
+  wrist2_Link:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.05
+    - center: [0.0, 0.05, 0.0]
+      radius: 0.05
+  wrist3_Link:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.05

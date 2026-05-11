@@ -1,0 +1,100 @@
+api_version: 1.0
+
+# Aubo i3H robot description for Lula / Geometric Fabrics
+# 6-DOF collaborative robot, no gripper
+# EEF frame: wrist3_Link
+
+cspace:
+    - shoulder_joint
+    - upperArm_joint
+    - foreArm_joint
+    - wrist1_joint
+    - wrist2_joint
+    - wrist3_joint
+
+acceleration_limits: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+jerk_limits: [500.0, 500.0, 500.0, 500.0, 500.0, 500.0]
+
+root_link: base_link
+subtree_root_link: base_link
+
+default_q: [-0.03, -0.46, 1.5, 0.92, 0.2, 0.0]
+
+# No gripper joints to fix
+cspace_to_urdf_rules: []
+
+composite_task_spaces: []
+
+# collision_spheres must be a sequence of maps (lula requirement)
+collision_spheres:
+  - base_link:
+    - center: [-0.013, -0.004, 0.045]
+      radius: 0.0747
+    - center: [0.009, 0.007, 0.045]
+      radius: 0.0747
+  - shoulder_Link:
+    - center: [0.0, -0.001, -0.005]
+      radius: 0.07804
+  - upperArm_Link:
+    - center: [0.0, -0.0, -0.007]
+      radius: 0.06868
+    - center: [0.266, 0.001, 0.028]
+      radius: 0.06253
+    - center: [0.111, -0.0, 0.008]
+      radius: 0.05484
+    - center: [0.175, -0.0, 0.008]
+      radius: 0.05484
+    - center: [0.273, -0.002, -0.027]
+      radius: 0.05561
+    - center: [0.001, 0.003, 0.021]
+      radius: 0.06561
+    - center: [0.09, -0.002, 0.007]
+      radius: 0.0533
+    - center: [0.267, -0.0, 0.002]
+      radius: 0.06253
+    - center: [0.005, 0.005, -0.023]
+      radius: 0.06176
+    - center: [0.146, -0.001, 0.007]
+      radius: 0.05407
+    - center: [0.006, -0.01, 0.034]
+      radius: 0.05715
+    - center: [0.197, -0.008, 0.005]
+      radius: 0.04638
+    - center: [0.252, -0.006, -0.035]
+      radius: 0.04715
+    - center: [-0.014, -0.014, -0.035]
+      radius: 0.04946
+  - foreArm_Link:
+    - center: [0.257, -0.0, 0.096]
+      radius: 0.05773
+    - center: [0.044, -0.001, 0.102]
+      radius: 0.05701
+    - center: [0.123, -0.0, 0.103]
+      radius: 0.05701
+    - center: [0.179, 0.0, 0.103]
+      radius: 0.05701
+    - center: [0.257, -0.0, 0.122]
+      radius: 0.05773
+  - wrist1_Link:
+    - center: [0.0, 0.014, -0.0]
+      radius: 0.05838
+    - center: [-0.001, -0.023, -0.002]
+      radius: 0.05645
+    - center: [0.003, 0.025, -0.001]
+      radius: 0.05516
+    - center: [0.0, -0.003, -0.0]
+      radius: 0.05838
+  - wrist2_Link:
+    - center: [0.0, -0.01, -0.0]
+      radius: 0.05838
+    - center: [0.001, 0.023, -0.002]
+      radius: 0.05645
+    - center: [-0.003, -0.025, -0.001]
+      radius: 0.05516
+    - center: [0.005, -0.028, 0.002]
+      radius: 0.05258
+    - center: [-0.0, 0.003, -0.0]
+      radius: 0.05838
+  - wrist3_Link:
+    - center: [-0.001, -0.0, -0.019]
+      radius: 0.04913

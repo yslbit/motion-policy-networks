@@ -1,0 +1,120 @@
+# Dockerfile.aubo.hybrid
+#
+# Data-generation image for Aubo i3H with ALL hybrid planners:
+#   - Global:        OMPL RRTConnect (joint-space)
+#   - Hybrid AIT*:   OMPL AIT* (joint-space optimizer)
+#   - Hybrid Fabric: SE3 EEF plan + lula Geometric Fabrics (from Isaac Sim)
+#   - Hybrid cuRobo: GPU-accelerated MotionGen
+#
+# Base: curobo_docker:isaac_sim_4.5.0
+#   Python 3.10 at /isaac-sim/kit/python/bin/python3
+#   Has: torch 2.5.1, numpy 1.26.4, lula, curobo 0.7.7, CUDA
+#
+# Build (from repository root):
+#   docker build -f docker/Dockerfile.aubo.hybrid -t mpinets-aubo-hybrid:latest .
+#
+# Run (interactive):
+#   docker run --gpus all --rm -it \
+#     -v $(pwd)/data:/data \
+#     mpinets-aubo-hybrid:latest bash
+#
+# Generate data (all hybrid planners):
+#   docker run --gpus all --rm \
+#     -v $(pwd)/data/output:/data \
+#     mpinets-aubo-hybrid:latest \
+#     python -m mpinets.data_pipeline.gen_data_aubo tabletop \
+#       --planner-mode all \
+#       --fabric-urdf /workspace/mpinets/third_party/robofin/robofin/urdf/aubo_i3H/aubo_i3H.urdf \
+#       full-pipeline /data
+
+FROM curobo_docker:isaac_sim_4.5.0
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Isaac Sim Python 3.10 is the only usable Python in this image.
+# Alias it so that `python` and `pip` resolve to the Isaac Sim environment.
+# ──────────────────────────────────────────────────────────────────────────────
+ENV ISAACSIM_PYTHON=/isaac-sim/kit/python/bin/python3
+ENV ISAACSIM_PIP="${ISAACSIM_PYTHON} -m pip"
+RUN ln -sf ${ISAACSIM_PYTHON} /usr/local/bin/python \
+ && ln -sf ${ISAACSIM_PYTHON} /usr/local/bin/python3
+
+# ──────────────────────────────────────────────────────────────────────────────
+# System packages (build-essential, cmake already in base image)
+# Switch to USTC mirror for reliable access from China
+# ──────────────────────────────────────────────────────────────────────────────
+RUN sed -i 's|http://archive.ubuntu.com|http://mirrors.ustc.edu.cn|g' /etc/apt/sources.list \
+ && sed -i 's|http://security.ubuntu.com|http://mirrors.ustc.edu.cn|g' /etc/apt/sources.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        liblapack-dev libblas-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Python packages into Isaac Sim's Python 3.10 environment
+# ──────────────────────────────────────────────────────────────────────────────
+RUN ${ISAACSIM_PIP} install --no-cache-dir \
+        ompl==1.7.0 \
+        h5py \
+        trimesh \
+        pybullet \
+        pyquaternion \
+        tqdm \
+        urchin==0.0.30 \
+        yourdfpy \
+        shapely \
+        rtree \
+        triangle \
+        termcolor \
+        numba \
+        six \
+        lxml \
+        pycollada \
+        networkx \
+        packaging \
+        pyyaml
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Local third-party packages
+# ──────────────────────────────────────────────────────────────────────────────
+WORKDIR /workspace
+
+COPY mpinets/third_party/geometrout         /workspace/mpinets/third_party/geometrout
+COPY mpinets/third_party/robofin            /workspace/mpinets/third_party/robofin
+COPY mpinets/third_party/atob-aubo          /workspace/mpinets/third_party/atob-aubo
+COPY mpinets/third_party/ikfast_pybind_aubo /workspace/mpinets/third_party/ikfast_pybind_aubo
+
+RUN ${ISAACSIM_PIP} install --no-cache-dir -e /workspace/mpinets/third_party/geometrout \
+ && ${ISAACSIM_PIP} install --no-cache-dir -e /workspace/mpinets/third_party/atob-aubo \
+ && cd /workspace/mpinets/third_party/ikfast_pybind_aubo \
+ && ${ISAACSIM_PIP} install --no-cache-dir --no-build-isolation -e . \
+ && ${ISAACSIM_PIP} install --no-cache-dir -e /workspace/mpinets/third_party/robofin
+
+# Main mpinets package + configs
+COPY setup.cfg pyproject.toml /workspace/
+COPY mpinets /workspace/mpinets
+COPY config  /workspace/config
+COPY jobconfig_aubo.yaml /workspace/
+RUN ${ISAACSIM_PIP} install --no-cache-dir -e /workspace
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Environment
+# ──────────────────────────────────────────────────────────────────────────────
+ENV DISPLAY=""
+ENV MPLBACKEND=Agg
+# ikfast .so + lula from Isaac Sim + ml_archive torch (cu118, compatible
+# with driver 570+).  The base image ships torch 2.11+cu130 in site-packages
+# which requires CUDA 13.0 / driver 575+.  Prepending the ml_archive
+# prebundle path forces cuRobo to pick up the cu118 torch instead.
+ENV PYTHONPATH="/isaac-sim/exts/omni.isaac.ml_archive/pip_prebundle:/workspace/mpinets/third_party/ikfast_pybind_aubo:/isaac-sim/exts/isaacsim.robot_motion.lula/pip_prebundle"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pre-compile Numba JIT functions
+# ──────────────────────────────────────────────────────────────────────────────
+COPY docker/warmup_numba.py /tmp/warmup_numba.py
+RUN python /tmp/warmup_numba.py
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["bash"]

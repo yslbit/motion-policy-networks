@@ -1,0 +1,15 @@
+.git
+.conda-envs
+.pytest_cache
+.vscode
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+**/build/
+
+checkpoints/
+data/
+model_wight/
+
+mpinets/third_party/ikfast_pybind_aubo/*.so
