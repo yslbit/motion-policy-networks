@@ -119,7 +119,6 @@ class AuboPointCloudBase(Dataset):
     def _sampler(self) -> TorchAuboSampler:
         if self._fk_sampler is None:
             self._fk_sampler = TorchAuboSampler(
-                num_robot_points=max(self.num_robot_points, self.num_target_points),
                 use_cache=True,
                 device="cpu",
             )

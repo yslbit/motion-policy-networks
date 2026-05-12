@@ -65,6 +65,7 @@ class AuboCollisionAndBCLossContainer:
                 num_robot_points=self.num_points,
                 use_cache=True,
                 device=str(input_normalized.device),
+                with_base_link=False,
             )
 
         # Run all FK and loss computation in float32; AMP autocast would turn FK

@@ -210,7 +210,7 @@ def main():
     dm_params = cfg["data_module_parameters"]
     dm = AuboDataModule(
         data_dir=dm_params["data_dir"],
-        trajectory_key=dm_params.get("trajectory_key", "global_solutions"),
+        trajectory_key=dm_params.get("trajectory_key", "hybrid_solutions"),
         num_robot_points=cfg["shared_parameters"]["num_robot_points"],
         num_obstacle_points=dm_params["num_obstacle_points"],
         num_target_points=dm_params["num_target_points"],

@@ -20,7 +20,7 @@ limit_val_batches: 50
 num_sanity_val_steps: 0
 float32_matmul_precision: high
 gpus: 1
-batch_size: 256
+batch_size: 512
 # Reduced from 69: speeds up intermediate validation; set back to 69 for final evaluation
 val_rollout_steps: 69
 save_checkpoint_dir: /workspace/mpinets_checkpoints_aubo
