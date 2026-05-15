@@ -168,6 +168,7 @@ mpinets/third_party/geometrout
 mpinets/third_party/robofin
 model_weights/
 checkpoints/
+checkpoints_aubo/
 robofin_cache/
 tests/
 scripts/
